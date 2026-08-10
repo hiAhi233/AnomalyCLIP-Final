@@ -1,0 +1,1 @@
+from trainers.AnomalyDetect.report_generator import MedicalReportGenerator

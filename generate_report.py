@@ -1,0 +1,405 @@
+"""
+演示脚本：医学超声影像报告生成
+================================================================
+用法:
+    # 使用模拟数据演示报告生成
+    python generate_report.py --demo
+
+    # 使用真实模型推理（需先训练或加载检查点）
+    python generate_report.py --config-file configs/trainers/AnomalyDetect/few_shot/busi.yaml \
+                              --dataset-config-file configs/datasets/busi.yaml \
+                              --model-dir <checkpoint_dir> \
+                              --image-path <image.jpg>
+"""
+
+import argparse
+import json
+import os
+import sys
+import random
+from datetime import datetime
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="timm")
+warnings.filterwarnings("ignore", message=".*timm.models.layers.*")
+
+# 修复 Windows 控制台 GBK 编码问题
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+
+def demo_mode():
+    """
+    使用模拟的模型输出演示报告生成，无需加载真实模型。
+    模拟一个 BUSI 恶性病变的典型场景。
+    """
+    print("=" * 64)
+    print("  医学超声影像报告生成 — 演示模式（模拟数据）")
+    print("=" * 64)
+    print()
+
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location(
+        "report_generator",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "trainers", "AnomalyDetect", "report_generator.py"))
+    _rg = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_rg)
+    MedicalReportGenerator = _rg.MedicalReportGenerator
+
+    # ---- 模拟 BUSI 分类输出 (benign, malignant, normal) ----
+    classnames = ["benign", "malignant", "normal"]
+
+    # 模拟一个恶性病变的推理输出
+    logits = torch.tensor([0.8, 4.2, 0.3])  # malignant 得分最高
+
+    # 模拟异常分数
+    s_img = torch.tensor(0.72)               # 较显著异常
+
+    # 模拟 patch 级异常分数 (14x14=196 patches)
+    np.random.seed(42)
+    anomaly_scores = np.random.beta(2, 3, size=(14, 14)).astype(np.float32)
+    # 让中心区域异常更高
+    for i in range(14):
+        for j in range(14):
+            dist = ((i - 7) ** 2 + (j - 7) ** 2) ** 0.5
+            if dist < 4:
+                anomaly_scores[i, j] = 0.6 + random.random() * 0.4
+    anomaly_scores = torch.from_numpy(anomaly_scores.flatten())
+
+    # 模拟概念分数
+    concept_scores = {
+        "normal": {
+            "normal_tissue": torch.tensor(0.12),
+            "regular_architecture": torch.tensor(0.18),
+            "isoechoic_texture": torch.tensor(0.10),
+        },
+        "anomaly": {
+            "tumor_mass": torch.tensor(0.85),
+            "inflammation": torch.tensor(0.55),
+            "necrosis": torch.tensor(0.38),
+            "calcification": torch.tensor(0.22),
+            "cyst_fluid": torch.tensor(0.05),
+            "fibrosis_scar": torch.tensor(0.15),
+        },
+    }
+
+    outputs = (logits, s_img, anomaly_scores, concept_scores, None)
+
+    # ---- 生成报告 ----
+    generator = MedicalReportGenerator(
+        classnames=classnames,
+        dataset_name="BUSI",
+        modality="乳腺超声",
+    )
+
+    result = generator.generate(
+        outputs=outputs,
+        patient_id="DEMO001",
+    )
+
+    # ---- 打印报告 ----
+    print(result["raw_text"])
+    print()
+
+    # ---- 展示 LLM 润色接口 ----
+    print("─" * 64)
+    print("  LLM 润色接口演示")
+    print("─" * 64)
+    print()
+    print(">>> 以下是可以发送给大模型的润色 prompt：")
+    print()
+    print(generator.get_llm_polish_prompt())
+    print()
+    print("─" * 64)
+    print("  使用方法:")
+    print("  1. 复制上方的 prompt 发送给 ChatGPT / Claude / DeepSeek 等大模型")
+    print("  2. 将大模型返回的润色后报告文本传给 report_generator.apply_llm_polish()")
+    print("  3. 调用 report_generator.get_final_report() 获取润色后的报告")
+    print("─" * 64)
+
+    # ---- 展示评分模块 ----
+    print()
+    print("─" * 64)
+    print("  报告评分演示")
+    print("─" * 64)
+    from trainers.AnomalyDetect.report_scorer import ReportScorer
+    scorer = ReportScorer()
+    # 用这份模拟报告做单份评分展示
+    single_score = scorer.score_single(result, "malignant")
+    print(f"\n  单份报告评分 (真实标签=malignant):")
+    print(f"    诊断准确性:     {single_score['diagnosis_correct']:.0f} / 100")
+    print(f"    异常分级对齐:   {single_score['anomaly_alignment']:.0f} / 100")
+    print(f"    征象覆盖度:     {single_score['concept_coverage']:.0f} / 100")
+    print(f"    安全性指标:     {single_score['safety']:.0f} / 100")
+    print(f"    结构完整性:     {single_score['structure_complete']:.0f} / 100")
+    print(f"    {'─'*40}")
+    print(f"    综合得分:       {single_score['overall']:.1f} / 100")
+
+    return result
+
+
+def real_mode(config_file, dataset_config_file, model_dir, image_path):
+    """
+    加载真实模型进行推理并生成报告。
+    """
+    from dassl.config import get_cfg_default
+    from dassl.engine import build_trainer
+    from dassl.utils import setup_logger, set_random_seed
+
+    import trainers.AnomalyDetect.anomaly_detect
+    from trainers.AnomalyDetect.report_generator import MedicalReportGenerator  # noqa: F811
+
+    # ---- 加载配置 ----
+    from train import setup_cfg, extend_cfg
+
+    _model_dir = model_dir  # 捕获函数参数，class body 中无法直接引用
+
+    class Args:
+        root = "data"
+        output_dir = ""
+        resume = ""
+        seed = 1
+        source_domains = None
+        target_domains = None
+        transforms = None
+        trainer = "AnomalyDetect_BiomedCLIP"
+        backbone = "ViT-B/16"
+        head = ""
+        eval_only = True
+        model_dir = _model_dir
+        load_epoch = None
+        no_train = True
+        opts = []
+
+    if config_file:
+        Args.config_file = config_file
+    else:
+        Args.config_file = "configs/trainers/AnomalyDetect/few_shot/busi.yaml"
+
+    if dataset_config_file:
+        Args.dataset_config_file = dataset_config_file
+    else:
+        Args.dataset_config_file = "configs/datasets/busi.yaml"
+
+    from train import main as train_main
+
+    print("=" * 64)
+    print("  医学超声影像报告生成 — 真实推理模式")
+    print("=" * 64)
+    print(f"  配置文件: {Args.config_file}")
+    print(f"  模型目录: {model_dir}")
+    print()
+
+    # 构建 trainer
+    import argparse as _argparse
+    parser = _argparse.ArgumentParser()
+    parser.add_argument("--root", type=str, default="data")
+    parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--source-domains", type=str, nargs="+")
+    parser.add_argument("--target-domains", type=str, nargs="+")
+    parser.add_argument("--transforms", type=str, nargs="+")
+    parser.add_argument("--config-file", type=str, default=Args.config_file)
+    parser.add_argument("--dataset-config-file", type=str, default=Args.dataset_config_file)
+    parser.add_argument("--trainer", type=str, default="AnomalyDetect_BiomedCLIP")
+    parser.add_argument("--backbone", type=str, default="ViT-B/16")
+    parser.add_argument("--head", type=str, default="")
+    parser.add_argument("--eval-only", action="store_true", default=True)
+    parser.add_argument("--model-dir", type=str, default=model_dir)
+    parser.add_argument("--load-epoch", type=int)
+    parser.add_argument("--no-train", action="store_true", default=True)
+    parser.add_argument("opts", nargs=_argparse.REMAINDER)
+
+    known_args = parser.parse_args()
+
+    from train import setup_cfg
+    cfg = setup_cfg(known_args)
+
+    if cfg.SEED >= 0:
+        set_random_seed(cfg.SEED)
+    setup_logger(cfg.OUTPUT_DIR)
+
+    trainer = build_trainer(cfg)
+
+    if model_dir:
+        # 自动检测最新 checkpoint
+        ckpt_dir = os.path.join(model_dir, "anomaly_clip")
+        if os.path.isdir(ckpt_dir):
+            epochs = []
+            for f in os.listdir(ckpt_dir):
+                if f.startswith("model.pth.tar-"):
+                    try:
+                        epochs.append(int(f.split("-")[-1]))
+                    except ValueError:
+                        pass
+            epoch = max(epochs) if epochs else None
+        else:
+            epoch = None
+        trainer.load_model(model_dir, epoch=epoch)
+
+    # 获取 classnames
+    classnames = trainer.dm.dataset.classnames
+
+    # 创建报告生成器（模态从数据集名推断，也可配置）
+    modality_map = {"BUSI": "乳腺超声", "Thymoma": "胸部CT", "BTMRI": "脑部MRI", "CTKidney": "肾脏CT",
+                    "COVID_19": "胸部CT", "Kvasir": "消化道内镜", "RETINA": "眼底照相"}
+    modality = modality_map.get(cfg.DATASET.NAME, "医学影像")
+    generator = MedicalReportGenerator(
+        classnames=classnames,
+        dataset_name=cfg.DATASET.NAME,
+        modality=modality,
+    )
+
+    # 创建报告输出目录
+    report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "output", "generated_reports")
+    os.makedirs(report_dir, exist_ok=True)
+
+    # 加载真实医生报告作为 NLG 参考
+    import re, json as _json
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", cfg.DATASET.NAME)
+    real_refs = {}  # patient_id → report text
+    for cls_dir in os.listdir(data_dir):
+        cls_path = os.path.join(data_dir, cls_dir)
+        if not os.path.isdir(cls_path):
+            continue
+        for f in os.listdir(cls_path):
+            if f.endswith("_报告.txt"):
+                m = re.match(r'P(\d+)_报告\.txt', f)
+                if m:
+                    pid = int(m.group(1))
+                    with open(os.path.join(cls_path, f), "r", encoding="utf-8") as fp:
+                        real_refs[pid] = fp.read().strip()
+    print(f"  加载了 {len(real_refs)} 份真实报告作为 NLG 参考")
+
+    # 读 split JSON 获取测试集路径→患者ID映射
+    split_path = os.path.join(data_dir, f"split_{cfg.DATASET.NAME}.json")
+    test_paths = []
+    if os.path.exists(split_path):
+        with open(split_path, "r", encoding="utf-8") as f:
+            split = _json.load(f)
+        test_paths = [item[0] for item in split.get("test", [])]
+        print(f"  测试集 {len(test_paths)} 个样本")
+
+    test_loader = trainer.test_loader
+    trainer.model.eval()
+
+    patient_idx = 0
+    correct_total = 0
+    total_samples = 0
+    all_results = []
+    all_labels = []
+    all_ref_texts = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            image = batch["img"].to(trainer.device)
+            label = batch["label"]
+            outputs = trainer.model(image)
+
+            B = image.shape[0]
+            for i in range(B):
+                # 匹配真实报告
+                ref_text = ""
+                idx_in_test = patient_idx
+                if idx_in_test < len(test_paths):
+                    # 路径格式: "thymoma\P124_平扫_z54.png"
+                    path = test_paths[idx_in_test]
+                    m = re.match(r'P(\d+)_', os.path.basename(path))
+                    if m:
+                        pid = int(m.group(1))
+                        ref_text = real_refs.get(pid, "")
+
+                single_outputs = (
+                    outputs[0][i:i+1],
+                    outputs[1][i] if outputs[1].dim() > 0 else outputs[1],
+                    outputs[2][i:i+1] if outputs[2].dim() > 1 else outputs[2],
+                    outputs[3],
+                    outputs[4][i:i+1] if outputs[4] is not None and outputs[4].dim() > 1 else outputs[4],
+                )
+
+                result = generator.generate(
+                    outputs=single_outputs,
+                    patient_id=f"P{patient_idx+1:04d}",
+                )
+
+                true_label = classnames[label[i].item()]
+                all_results.append(result)
+                all_labels.append(true_label)
+                all_ref_texts.append(ref_text)
+
+                pred_label = result["findings"]["top_class"]
+                total_samples += 1
+                if pred_label == true_label:
+                    correct_total += 1
+
+                report_path = os.path.join(report_dir, f"P{patient_idx+1:04d}_超声报告.txt")
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(result["raw_text"])
+
+                patient_idx += 1
+
+                if patient_idx <= 3:
+                    print(f"\n{'─'*64}")
+                    print(f"  患者 {patient_idx} / 真实标签: {true_label} / 预测: {pred_label}")
+                    if ref_text:
+                        print(f"  参考报告(前80字): {ref_text[:80]}...")
+                    print(f"{'─'*64}")
+                    print(result["raw_text"])
+
+    # 打印汇总
+    acc = correct_total / total_samples * 100 if total_samples > 0 else 0
+    print(f"\n{'═'*64}")
+    print(f"  报告生成完成")
+    print(f"  总计: {total_samples} 份报告")
+    print(f"  预测正确: {correct_total}/{total_samples} ({acc:.1f}%)")
+    print(f"  存放路径: {report_dir}")
+    print(f"{'═'*64}")
+
+    # ---- 评分（PromptMRG 风格）----
+    from trainers.AnomalyDetect.report_scorer import ReportScorer
+    scorer = ReportScorer()
+    has_real_refs = any(t for t in all_ref_texts)
+    metrics = scorer.score_batch(all_results, all_labels,
+        reference_texts=all_ref_texts if has_real_refs else None)
+
+    # 打印简要汇总
+    print(f"\n  CE: P={metrics['ce_precision']:.3f}  R={metrics['ce_recall']:.3f}  F1={metrics['ce_f1']:.3f}")
+    print(f"  NLG: BLEU-1={metrics['BLEU_1']:.1f}  BLEU-4={metrics['BLEU_4']:.1f}  ROUGE_L={metrics['ROUGE_L']:.1f}")
+    print(f"  Accuracy: {metrics['accuracy']:.1f}%  (N={metrics['count']})")
+
+    # 保存所有评分数据
+    score_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "output", "evaluation")
+    scorer.save(all_results, all_labels, metrics, score_dir)
+
+    return generator
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="医学超声影像报告生成")
+    parser.add_argument("--demo", action="store_true", default=True,
+                        help="使用模拟数据演示（默认）")
+    parser.add_argument("--config-file", type=str, default="",
+                        help="方法配置文件路径")
+    parser.add_argument("--dataset-config-file", type=str, default="",
+                        help="数据集配置文件路径")
+    parser.add_argument("--model-dir", type=str, default="",
+                        help="模型检查点目录（用于真实推理）")
+    parser.add_argument("--image-path", type=str, default="",
+                        help="待分析的图像路径")
+    args = parser.parse_args()
+
+    # 默认使用演示模式
+    if args.model_dir:
+        real_mode(args.config_file, args.dataset_config_file,
+                  args.model_dir, args.image_path)
+    else:
+        demo_mode()

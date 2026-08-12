@@ -26,9 +26,8 @@ from collections import defaultdict
 # 配置
 # ============================================================
 
-NII_DIR = r"D:\图神经网络\异常检测\一致性图像（可重复勾画的实验）"
-EXCEL_PATH = os.path.join(NII_DIR,
-    "5.胸腺瘤CT报告233例（别外传，报告还是算隐私的）.xlsx")
+NII_DIR = r"D:\图神经网络\异常检测\全部图像及ROI"
+EXCEL_PATH = r"D:\图神经网络\异常检测\一致性图像（可重复勾画的实验）\5.胸腺瘤CT报告233例（别外传，报告还是算隐私的）.xlsx"
 OUT_DIR = r"D:\图神经网络\异常检测\代码demo4\BiomedCoOp-main\data\Thymoma"
 
 WINDOW_WIDTH = 400   # CT 窗宽
@@ -115,20 +114,21 @@ def main():
     df['自编号'] = df['自编号'].astype(int)
     print(f"Excel: {len(df)} 条报告")
 
-    # ---- 扫描 nii 文件 ----
+    # ---- 递归扫描 nii 文件（233 例分布在多个子目录: 003-65/ 124-220/ ...）----
     nii_files = defaultdict(dict)
-    for f in os.listdir(NII_DIR):
-        m = re.match(r'^(\d{3})(\d{3})(-origin)?\.nii\.gz$', f)
-        if not m:
-            continue
-        pid = int(m.group(1))
-        suffix = m.group(2)   # "000" or "020"
-        is_origin = m.group(3) is not None
+    for root, dirs, files in os.walk(NII_DIR):
+        for f in files:
+            m = re.match(r'^(\d{3})(\d{3})(-origin)?\.nii\.gz$', f)
+            if not m:
+                continue
+            pid = int(m.group(1))
+            suffix = m.group(2)   # "000" or "020"
+            is_origin = m.group(3) is not None
 
-        if is_origin:
-            nii_files[pid][f"{suffix}_ct"] = os.path.join(NII_DIR, f)
-        else:
-            nii_files[pid][f"{suffix}_roi"] = os.path.join(NII_DIR, f)
+            if is_origin:
+                nii_files[pid][f"{suffix}_ct"] = os.path.join(root, f)
+            else:
+                nii_files[pid][f"{suffix}_roi"] = os.path.join(root, f)
 
     print(f"nii: {len(nii_files)} 例患者")
 

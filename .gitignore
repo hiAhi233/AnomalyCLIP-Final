@@ -16,3 +16,4 @@ tensorboard/
 assets/
 BiomedCoOp-main/
 Dassl.pytorch/
+memory_bank_thymoma.pt

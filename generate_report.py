@@ -292,11 +292,14 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     trainer.model.eval()
 
     patient_idx = 0
+    slice_idx = 0
     correct_total = 0
     total_samples = 0
     all_results = []
     all_labels = []
     all_ref_texts = []
+    _gen_cache = [None]  # GEN_MODE 词表缓存
+    _seen_patients = set()  # 去重: 每患者只出一份报告
 
     with torch.no_grad():
         for batch in test_loader:
@@ -306,16 +309,22 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
 
             B = image.shape[0]
             for i in range(B):
-                # 匹配真实报告
+                # 解析患者 ID + 去重 (一份报告/患者)
                 ref_text = ""
-                idx_in_test = patient_idx
-                if idx_in_test < len(test_paths):
-                    # 路径格式: "thymoma\P124_平扫_z54.png"
-                    path = test_paths[idx_in_test]
+                pid = None
+                if slice_idx < len(test_paths):
+                    path = test_paths[slice_idx]
                     m = re.match(r'P(\d+)_', os.path.basename(path))
                     if m:
                         pid = int(m.group(1))
                         ref_text = real_refs.get(pid, "")
+                slice_idx += 1
+
+                # 同患者多切片 → 只取第一张 (z 轴排序, 最靠近肿瘤中心)
+                if pid is not None and pid in _seen_patients:
+                    continue
+                if pid is not None:
+                    _seen_patients.add(pid)
 
                 single_outputs = (
                     outputs[0][i:i+1],
@@ -329,6 +338,72 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                     outputs=single_outputs,
                     patient_id=f"P{patient_idx+1:04d}",
                 )
+
+                # ---- GEN_MODE: 用 ReportGenNet 生成真实中文报告 + MLC 征象 (替换模板) ----
+                gen_mode = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_MODE', False)
+                if patient_idx == 0:
+                    print(f'[DEBUG] gen_mode={gen_mode} has_report_gen={hasattr(trainer.model, "report_gen")}')
+                if gen_mode and hasattr(trainer.model, 'report_gen'):
+                    if _gen_cache[0] is None:
+                        import pickle as _pkl
+                        vp = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', 'data/Thymoma/vocab.pkl')
+                        with open(vp, 'rb') as f:
+                            _gen_cache[0] = _pkl.load(f)
+                    masked_img = single_outputs[4]
+                    masked_feat, _ = trainer.model._extract_patch_tokens(masked_img)
+                    masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
+
+                    # --- CE 征象: 从生成文本做否定过滤关键词匹配 (绕过MLC错误标签) ---
+                    finding_order = ["tumor_mass", "inflammation", "necrosis", "calcification",
+                                     "cyst_fluid", "fibrosis_scar", "normal_tissue",
+                                     "regular_architecture", "isoechoic_texture"]
+                    finding_keywords = {
+                        "tumor_mass": ["肿块","占位","结节","肿物","软组织影","团块"],
+                        "inflammation": ["炎性","炎症","炎变","感染"],
+                        "necrosis": ["坏死","液化"],
+                        "calcification": ["钙化","钙灶"],
+                        "cyst_fluid": ["囊肿","囊性","囊变","囊状","液性"],
+                        "fibrosis_scar": ["纤维","瘢痕","条索"],
+                        "normal_tissue": ["未见异常","未见明确","未见明显","正常","清晰","无异常"],
+                        "regular_architecture": ["规则","规整","光整","清晰","分界清","边界清"],
+                        "isoechoic_texture": ["均匀","一致","密度均匀"],
+                    }
+                    negation_words = ["未见","未发现","无明显","未见明确","未见明显","排除",
+                                      "不除外","不考虑","未见异常","无异常","无明确","未见肿物","无肿物"]
+                    finding_cn_map = {
+                        "tumor_mass": "实性占位征象","inflammation":"炎性改变征象","necrosis":"坏死液化征象",
+                        "calcification":"钙化灶征象","cyst_fluid":"囊性结构征象","fibrosis_scar":"纤维化/瘢痕征象",
+                        "normal_tissue":"正常组织回声/密度","regular_architecture":"结构规整性","isoechoic_texture":"质地均匀性"}
+                    norm_names={"normal_tissue","regular_architecture","isoechoic_texture"}
+                    anom_c, norm_c = [], []
+                    for fn in finding_order:
+                        kws = finding_keywords.get(fn, [])
+                        level = "未见"
+                        for kw in kws:
+                            idx = result["raw_text"].find(kw)
+                            if idx >= 0:
+                                prefix = result["raw_text"][max(0,idx-15):idx]
+                                if any(n in prefix for n in negation_words):
+                                    continue
+                                level = "显著"  # 简单规则: 找到就标显著
+                                break
+                        item = {"name":finding_cn_map.get(fn,fn), "level":level, "desc":"文本匹配"}
+                        if fn in norm_names:
+                            norm_c.append(item)
+                        else:
+                            anom_c.append(item)
+                    result["findings"]["anomaly_concepts"] = anom_c
+                    result["findings"]["normal_concepts"] = norm_c
+
+                    # --- 生成文本 ---
+                    gen_texts = trainer.model.report_gen.generate(
+                        masked_feat_norm, _gen_cache[0],
+                        max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
+                        max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
+                    gen_text = gen_texts[0] if gen_texts else ""
+                    if gen_text:
+                        result["raw_text"] = f"医学影像AI辅助分析报告\n\n{gen_text}\n\n免责声明:\n本报告由AI辅助分析系统自动生成，仅供临床参考。"
+                        result["gen_text"] = gen_text
 
                 true_label = classnames[label[i].item()]
                 all_results.append(result)
@@ -375,10 +450,12 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     print(f"  NLG: BLEU-1={metrics['BLEU_1']:.1f}  BLEU-4={metrics['BLEU_4']:.1f}  ROUGE_L={metrics['ROUGE_L']:.1f}")
     print(f"  Accuracy: {metrics['accuracy']:.1f}%  (N={metrics['count']})")
 
-    # 保存所有评分数据
+    # 保存所有评分数据 (dataset_name + 真实参考报告)
     score_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "output", "evaluation")
-    scorer.save(all_results, all_labels, metrics, score_dir)
+    scorer.save(all_results, all_labels, metrics, score_dir,
+                method_name="AnomalyCLIP", dataset_name=cfg.DATASET.NAME,
+                reference_texts=all_ref_texts)
 
     return generator
 

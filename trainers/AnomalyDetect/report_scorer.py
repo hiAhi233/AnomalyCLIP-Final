@@ -360,10 +360,15 @@ class ReportScorer:
     # ----------------------------------------------------------
 
     def save(self, reports, labels, metrics, output_dir,
-             method_name="AnomalyCLIP"):
+             method_name="AnomalyCLIP", dataset_name="BUSI",
+             reference_texts=None):
         os.makedirs(output_dir, exist_ok=True)
 
-        ref_texts = [generate_pseudo_reference(lbl) for lbl in labels]
+        # 参考报告: 真实报告优先, 无则伪参考
+        if reference_texts and any(reference_texts):
+            ref_texts = reference_texts
+        else:
+            ref_texts = [generate_pseudo_reference(lbl) for lbl in labels]
 
         # test_gts.txt / test_res.txt
         with open(os.path.join(output_dir, "test_gts.txt"), "w", encoding="utf-8") as f:
@@ -394,7 +399,7 @@ class ReportScorer:
         # metrics.json
         save_metrics = {
             "method": method_name,
-            "dataset": "BUSI",
+            "dataset": dataset_name,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "num_samples": metrics["count"],
             "ce_metrics": {
@@ -431,7 +436,7 @@ class ReportScorer:
             if not file_exists:
                 writer.writerow(headers)
             writer.writerow([
-                method_name, "BUSI", datetime.now().strftime("%Y-%m-%d"),
+                method_name, dataset_name, datetime.now().strftime("%Y-%m-%d"),
                 metrics["ce_precision"], metrics["ce_recall"], metrics["ce_f1"],
                 metrics["ce_micro_precision"], metrics["ce_micro_recall"], metrics["ce_micro_f1"],
                 metrics["BLEU_1"], metrics["BLEU_2"], metrics["BLEU_3"], metrics["BLEU_4"],

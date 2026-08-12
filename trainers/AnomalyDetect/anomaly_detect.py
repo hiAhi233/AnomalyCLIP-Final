@@ -11,7 +11,9 @@ score_i = min_j ||patch_i - M_j||  →  anomaly map
 mask    = score > threshold        →  suppress background in input image
 """
 
+import os
 import os.path as osp
+import re
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -109,6 +111,27 @@ class AnomalyCLIP(nn.Module):
         self.patch_temperature = cfg.TRAINER.ANOMALY_DETECT.PATCH_TEMPERATURE
         self.mask_mode = getattr(cfg.TRAINER.ANOMALY_DETECT, 'MASK_MODE', True)
         self.bg_factor = getattr(cfg.TRAINER.ANOMALY_DETECT, 'BG_FACTOR', 0.3)
+        # ---- dual-stream fusion ----
+        self.lambda_fusion = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_FUSION', 0.7)
+        # ---- report generator (Vinyals-style hierarchical LSTM) ----
+        self.gen_mode = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_MODE', False)
+        self.lambda_tag = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_TAG', 0.5)
+        self.lambda_stop = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_STOP', 0.5)
+        self.lambda_word = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_WORD', 1.0)
+        if self.gen_mode:
+            from trainers.AnomalyDetect.report_generator_net import ReportGenNet
+            vocab_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', '')
+            vocab_size = 1008  # fallback (thymoma corpus default)
+            if vocab_path and os.path.exists(vocab_path):
+                import pickle as _pkl
+                with open(vocab_path, 'rb') as f:
+                    vocab_size = len(_pkl.load(f))
+            self.report_gen = ReportGenNet(
+                vocab_size=vocab_size,
+                s_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
+                n_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50),
+            )
+            print(f'Report generator initialized: vocab={vocab_size}')
         self.anomaly_indices = list(range(n_cls - 1))
 
     # ---- anchor encoding (shared with original) ----
@@ -138,7 +161,21 @@ class AnomalyCLIP(nn.Module):
         raw = self.image_encoder.trunk.forward_features(x)
         return self.image_encoder(x), raw[:, 1:, :]
 
-    def forward(self, image, label=None):
+    def _get_lambda(self, s_img):
+        """
+        双流融合权重: 掩膜可信(异常分高) → 偏向病灶聚焦流;
+        s_img 低(疑似无病灶, 掩膜不可信) → 回落偏向全图流。
+        """
+        lam = self.lambda_fusion
+        if isinstance(s_img, torch.Tensor):
+            s = s_img.mean().item()
+        else:
+            s = float(s_img)
+        if s < 0.2:
+            lam = min(lam, 0.3)
+        return lam
+
+    def forward(self, image, label=None, captions=None, prob_real=None, tag_target=None):
         logit_scale = self.logit_scale.exp()
 
         # ---- extract features ----
@@ -149,7 +186,7 @@ class AnomalyCLIP(nn.Module):
         prompts = self.prompt_learner()
         text_features = self.text_encoder(prompts, self.tokenized_prompts)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        logits = logit_scale * image_features_norm @ text_features.t()
+        logits_full = logit_scale * image_features_norm @ text_features.t()
 
         # ---- Path B (anomaly detection) ----
         patch_features = self.patch_proj(patch_tokens)      # [B, 196, 768]
@@ -195,6 +232,16 @@ class AnomalyCLIP(nn.Module):
                 bg_suppressed = image * (mask_224 + self.bg_factor * (1 - mask_224))
                 masked_image = torch.where(apply.view(-1,1,1,1), bg_suppressed, image)
 
+        # ---- dual-stream fusion: lesion-focused (masked) + full-image ----
+        if self.mask_mode and self.memory_bank is not None:
+            masked_feat, _ = self._extract_patch_tokens(masked_image)
+            masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
+            logits_masked = logit_scale * masked_feat_norm @ text_features.t()
+            lam = self._get_lambda(s_img)
+            logits = lam * logits_masked + (1 - lam) * logits_full
+        else:
+            logits = logits_full
+
         if self.prompt_learner.training:
             # ---- BiomedCoOp losses (unchanged) ----
             femb = self.prompt_learner.fixed_embeddings
@@ -236,9 +283,89 @@ class AnomalyCLIP(nn.Module):
             s_cls_anom = F.softmax(logits, dim=1)[:, self.anomaly_indices].sum(dim=1)
             loss_consist = F.l1_loss(s_img, s_cls_anom.detach()) * self.lambda_consist
 
-            return logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img
+            # ---- report generation branch (teacher forcing) ----
+            gen_losses = None
+            if self.gen_mode and captions is not None:
+                # 病灶聚焦全局特征 (masked 流) 作为生成器视觉输入
+                masked_feat, _ = self._extract_patch_tokens(masked_image)
+                masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
+                gen_losses = self.report_gen(
+                    masked_feat_norm, captions, prob_real, tag_target)
+                loss_ce = loss_ce \
+                    + self.lambda_tag * gen_losses['loss_tag'] \
+                    + self.lambda_stop * gen_losses['loss_stop'] \
+                    + self.lambda_word * gen_losses['loss_word']
+
+            return logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img, gen_losses
         else:
             return logits, s_img, anomaly_scores, concept_scores, masked_image
+
+
+# ============================================================
+#  报告数据包装器 (Dassl DatasetWrapper + captions/tags)
+# ============================================================
+
+try:
+    from dassl.data.data_manager import DatasetWrapper as DasslWrapper
+except ImportError:
+    DasslWrapper = None
+
+from trainers.AnomalyDetect.report_generator_net import FINDING_ORDER as _GEN_FINDINGS
+
+
+class ThymomaReportWrapper(DasslWrapper):
+    """标准 Dassl wrapper + 报告 token (患者 ID → captions.json / thymoma_tags.json)"""
+
+    def __init__(self, cfg, data_source, transform=None, is_train=False,
+                 vocab=None, captions=None, tags=None, s_max=8, n_max=50):
+        super().__init__(cfg, data_source, transform, is_train)
+        self.vocab = vocab
+        self.captions = captions      # {image_name: report_text}
+        self.tags = tags              # {pid_str: {finding: 0/1}}
+        self.s_max = s_max
+        self.n_max = n_max
+
+    def __getitem__(self, idx):
+        output = super().__getitem__(idx)
+        impath = output["impath"]
+
+        # 从图像名解析患者 ID + 报告
+        m = re.search(r'P(\d+)_', os.path.basename(impath))
+        if not m:
+            return output
+        pid = m.group(1)
+        report = self.captions.get(os.path.basename(impath), "") if self.captions else ""
+        if not report:
+            return output
+
+        # 分句 → token 序列 [s_max, n_max] + 真实句子标记 [s_max]
+        try:
+            import jieba
+            def _tok(s):
+                toks = list(jieba.cut(s))
+                return [t for t in toks if t.strip() and t not in "，。、；：？！（）【】《》…—·"]
+        except ImportError:
+            def _tok(s):
+                return list(s)
+
+        sentences = [s for s in report.replace("\n", "").split("。") if len(s) > 1]
+        sentences = sentences[:self.s_max]
+
+        padded = torch.zeros(self.s_max, self.n_max, dtype=torch.long)
+        prob_real = torch.zeros(self.s_max, dtype=torch.long)
+        for i, sent in enumerate(sentences):
+            words = _tok(sent)[:self.n_max - 2]
+            toks = [self.vocab('<start>')] + [self.vocab(w) for w in words] + [self.vocab('<end>')]
+            padded[i, :len(toks)] = torch.tensor(toks[:self.n_max], dtype=torch.long)
+            prob_real[i] = 1
+
+        output["captions"] = padded
+        output["prob_real"] = prob_real
+        output["tags"] = torch.tensor(
+            [self.tags.get(pid, {}).get(f, 0) for f in _GEN_FINDINGS],
+            dtype=torch.float) if self.tags else torch.zeros(len(_GEN_FINDINGS))
+
+        return output
 
 
 # ============================================================
@@ -250,6 +377,62 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
 
     def check_cfg(self, cfg):
         assert cfg.TRAINER.ANOMALY_DETECT.PREC in ["fp16", "fp32", "amp"]
+
+    def build_data_loader(self):
+        super().build_data_loader()
+
+        gen_mode = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'GEN_MODE', False)
+        if not gen_mode:
+            return
+
+        # ---- 加载报告语料: vocab + captions + tags ----
+        import json, pickle as _pkl
+        from functools import partial
+        from dassl.data.data_manager import build_data_loader as dassl_build_loader
+
+        data_dir = os.path.join(self.cfg.DATASET.ROOT, self.cfg.DATASET.NAME)
+        vocab_path = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', '')
+        if not vocab_path:
+            vocab_path = os.path.join(data_dir, 'vocab.pkl')
+        captions_path = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'CAPTION_JSON', '')
+        if not captions_path:
+            captions_path = os.path.join(data_dir, 'captions.json')
+        tags_path = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'TAGS_JSON', '')
+        if not tags_path:
+            tags_path = os.path.join(data_dir, 'thymoma_tags.json')
+
+        with open(vocab_path, 'rb') as f:
+            self.vocab = _pkl.load(f)
+        with open(captions_path, 'r', encoding='utf-8') as f:
+            captions = json.load(f)
+        tags = {}
+        if os.path.exists(tags_path):
+            with open(tags_path, 'r', encoding='utf-8') as f:
+                tags = json.load(f)
+        print(f'[ReportGen] vocab={len(self.vocab)} captions={len(captions)} tags={len(tags)}')
+
+        s_max = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8)
+        n_max = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50)
+
+        # ---- 重建训练 loader (带报告) ----
+        wrapper_cls = partial(ThymomaReportWrapper, vocab=self.vocab,
+                              captions=captions, tags=tags, s_max=s_max, n_max=n_max)
+        # 从 dm 内部取训练 transform (DataManager 未暴露, 用 _ 前缀属性)
+        tfm_train = getattr(self.dm, 'tfm_train', None)
+        if tfm_train is None:
+            from dassl.data.transforms import build_transform
+            tfm_train = build_transform(self.cfg, is_train=True)
+        self.train_loader_x = dassl_build_loader(
+            self.cfg,
+            sampler_type=self.cfg.DATALOADER.TRAIN_X.SAMPLER,
+            data_source=self.dm.dataset.train_x,
+            batch_size=self.cfg.DATALOADER.TRAIN_X.BATCH_SIZE,
+            n_domain=0,
+            n_ins=self.cfg.DATALOADER.TRAIN_X.N_INS,
+            tfm=tfm_train,
+            is_train=True,
+            dataset_wrapper=wrapper_cls,
+        )
 
     def build_model(self):
         cfg = self.cfg
@@ -266,7 +449,7 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
 
         self.model = AnomalyCLIP(cfg, classnames, bclip.eval(), tdescs)
 
-        names_to_update = ["prompt_learner.ctx", "patch_proj", "text_to_patch"]
+        names_to_update = ["prompt_learner.ctx", "patch_proj", "text_to_patch", "report_gen"]
         for n, p in self.model.named_parameters():
             p.requires_grad_(any(x in n for x in names_to_update))
 
@@ -288,6 +471,15 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         model = self.model
         prec = self.cfg.TRAINER.ANOMALY_DETECT.PREC
 
+        # ---- 报告生成数据 (GEN_MODE 时存在) ----
+        captions = batch.get("captions", None)
+        prob_real = batch.get("prob_real", None)
+        tag_target = batch.get("tags", None)
+        if captions is not None:
+            captions = captions.to(self.device)
+            prob_real = prob_real.to(self.device)
+            tag_target = tag_target.to(self.device)
+
         if prec == 'amp':
             with autocast():
                 loss = model(image, label)
@@ -296,15 +488,21 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img = model(image, label)
+            out = model(image, label, captions, prob_real, tag_target)
+            logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img = out[:6]
+            gen_losses = out[6] if len(out) > 6 else None
             loss = loss_ce + loss_sccm + loss_kdsp + loss_consist
 
             self.model_backward_and_update(loss)
 
-        return {"loss": loss.item(),
-                "loss_ce": loss_ce.item(), "loss_consist": loss_consist.item(),
-                "s_img_mean": s_img.mean().item(),
-                "acc": compute_accuracy(logits, label)[0].item()}
+        ret = {"loss": loss.item(),
+               "loss_ce": loss_ce.item(), "loss_consist": loss_consist.item(),
+               "s_img_mean": s_img.mean().item(),
+               "acc": compute_accuracy(logits, label)[0].item()}
+        if gen_losses is not None:
+            for k, v in gen_losses.items():
+                ret[f"gen_{k}"] = v.item()
+        return ret
 
     def parse_batch_train(self, batch):
         img, label = batch["img"].to(self.device), batch["label"].to(self.device)

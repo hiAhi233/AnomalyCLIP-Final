@@ -153,7 +153,6 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     from dassl.utils import setup_logger, set_random_seed
 
     import trainers.AnomalyDetect.anomaly_detect
-    from trainers.AnomalyDetect.report_generator import MedicalReportGenerator  # noqa: F811
 
     # ---- 加载配置 ----
     from train import setup_cfg, extend_cfg
@@ -247,16 +246,6 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     # 获取 classnames
     classnames = trainer.dm.dataset.classnames
 
-    # 创建报告生成器（模态从数据集名推断，也可配置）
-    modality_map = {"BUSI": "乳腺超声", "Thymoma": "胸部CT", "BTMRI": "脑部MRI", "CTKidney": "肾脏CT",
-                    "COVID_19": "胸部CT", "Kvasir": "消化道内镜", "RETINA": "眼底照相"}
-    modality = modality_map.get(cfg.DATASET.NAME, "医学影像")
-    generator = MedicalReportGenerator(
-        classnames=classnames,
-        dataset_name=cfg.DATASET.NAME,
-        modality=modality,
-    )
-
     # 创建报告输出目录
     report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "output", "generated_reports")
@@ -291,6 +280,33 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     test_loader = trainer.test_loader
     trainer.model.eval()
 
+    # ---- 预扫描: 每患者选代表切片 (增强期 + z 最大 = 肿瘤最大层) ----
+    # 文件名: P124_平扫_z52.png / P124_增强_z54.png
+    # 无此命名模式的数据集 (如 BUSI): 全部处理, 不按患者去重
+    chosen_indices = set()   # 被选中的切片下标
+    best_slice = {}          # pid -> (z, seq, idx)
+    patient_named = False
+    for idx, path in enumerate(test_paths):
+        m = re.match(r'P(\d+)_(\S+)_z(\d+)\.png', os.path.basename(path))
+        if not m:
+            continue
+        patient_named = True
+        pid = int(m.group(1))
+        seq = m.group(2)      # "平扫" or "增强"
+        z = int(m.group(3))
+        # 增强优先, 同序列 z 最大优先
+        key = (1 if "增强" in seq else 0, z)
+        if pid not in best_slice or key > best_slice[pid][0]:
+            best_slice[pid] = (key, idx)
+    if patient_named:
+        for pid, (_, idx) in best_slice.items():
+            chosen_indices.add(idx)
+        print(f"  测试集代表切片: {len(best_slice)} 个患者 (增强期肿瘤最大层)")
+    else:
+        # 无患者命名的数据集: 每张图独立处理
+        chosen_indices = set(range(len(test_paths)))
+        print(f"  测试集: {len(test_paths)} 张图像 (无患者命名, 逐张处理)")
+
     patient_idx = 0
     slice_idx = 0
     correct_total = 0
@@ -299,7 +315,6 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     all_labels = []
     all_ref_texts = []
     _gen_cache = [None]  # GEN_MODE 词表缓存
-    _seen_patients = set()  # 去重: 每患者只出一份报告
 
     with torch.no_grad():
         for batch in test_loader:
@@ -309,22 +324,19 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
 
             B = image.shape[0]
             for i in range(B):
-                # 解析患者 ID + 去重 (一份报告/患者)
-                ref_text = ""
-                pid = None
-                if slice_idx < len(test_paths):
-                    path = test_paths[slice_idx]
-                    m = re.match(r'P(\d+)_', os.path.basename(path))
-                    if m:
-                        pid = int(m.group(1))
-                        ref_text = real_refs.get(pid, "")
+                # 只处理代表切片, 其余跳过 (一份报告/患者)
+                if slice_idx not in chosen_indices:
+                    slice_idx += 1
+                    continue
                 slice_idx += 1
 
-                # 同患者多切片 → 只取第一张 (z 轴排序, 最靠近肿瘤中心)
-                if pid is not None and pid in _seen_patients:
-                    continue
-                if pid is not None:
-                    _seen_patients.add(pid)
+                # 匹配真实报告 (从代表切片的路径解析患者 ID)
+                ref_text = ""
+                path = test_paths[slice_idx - 1]
+                m = re.match(r'P(\d+)_', os.path.basename(path))
+                if m:
+                    pid = int(m.group(1))
+                    ref_text = real_refs.get(pid, "")
 
                 single_outputs = (
                     outputs[0][i:i+1],
@@ -334,12 +346,41 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                     outputs[4][i:i+1] if outputs[4] is not None and outputs[4].dim() > 1 else outputs[4],
                 )
 
-                result = generator.generate(
-                    outputs=single_outputs,
-                    patient_id=f"P{patient_idx+1:04d}",
-                )
+                # ---- 直接从模型输出构建 findings (不再走模板生成器) ----
+                probs = torch.softmax(single_outputs[0], dim=-1)
+                top_idx = probs.argmax(dim=-1).item()
+                top_prob = probs[0, top_idx].item()
+                top_class = classnames[top_idx] if top_idx < len(classnames) else "未知"
+                s_img_val = single_outputs[1]
+                if isinstance(s_img_val, torch.Tensor):
+                    s_img_val = s_img_val.item() if s_img_val.numel() == 1 else s_img_val.mean().item()
 
-                # ---- GEN_MODE: 用 ReportGenNet 生成真实中文报告 + MLC 征象 (替换模板) ----
+                def _lvl(x):
+                    if x >= 0.75: return "显著异常"
+                    if x >= 0.55: return "较显著异常"
+                    if x >= 0.35: return "中度异常"
+                    if x >= 0.15: return "轻度异常"
+                    return "未见异常"
+
+                result = {
+                    "report_id": f"AI-US-P{patient_idx+1:04d}",
+                    "patient_id": f"P{patient_idx+1:04d}",
+                    "report_time": "",
+                    "raw_text": "",
+                    "polished_text": None,
+                    "is_polished": False,
+                    "findings": {
+                        "top_class": top_class,
+                        "top_probability": round(top_prob, 4),
+                        "confidence": _lvl(top_prob) if top_prob >= 0.85 else "较高" if top_prob >= 0.7 else "中等",
+                        "anomaly_level": _lvl(s_img_val),
+                        "anomaly_score": round(s_img_val, 4),
+                        "anomaly_concepts": [],
+                        "normal_concepts": [],
+                    },
+                }
+
+                # ---- GEN_MODE: 用 ReportGenNet 生成中文报告 (唯一的文本来源) ----
                 gen_mode = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_MODE', False)
                 if patient_idx == 0:
                     print(f'[DEBUG] gen_mode={gen_mode} has_report_gen={hasattr(trainer.model, "report_gen")}')
@@ -353,7 +394,17 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                     masked_feat, _ = trainer.model._extract_patch_tokens(masked_img)
                     masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
 
-                    # --- CE 征象: 从生成文本做否定过滤关键词匹配 (绕过MLC错误标签) ---
+                    # --- ① 先用生成器写报告文本 ---
+                    gen_texts = trainer.model.report_gen.generate(
+                        masked_feat_norm, _gen_cache[0],
+                        max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
+                        max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
+                    gen_text = gen_texts[0] if gen_texts else ""
+                    if gen_text:
+                        result["raw_text"] = f"医学影像AI辅助分析报告\n\n{gen_text}\n\n免责声明:\n本报告由AI辅助分析系统自动生成，仅供临床参考。"
+                        result["gen_text"] = gen_text
+
+                    # --- ② 从生成文本提取 CE 征象 (否定过滤关键词匹配) ---
                     finding_order = ["tumor_mass", "inflammation", "necrosis", "calcification",
                                      "cyst_fluid", "fibrosis_scar", "normal_tissue",
                                      "regular_architecture", "isoechoic_texture"]
@@ -385,7 +436,7 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                                 prefix = result["raw_text"][max(0,idx-15):idx]
                                 if any(n in prefix for n in negation_words):
                                     continue
-                                level = "显著"  # 简单规则: 找到就标显著
+                                level = "显著"  # 找到即显著
                                 break
                         item = {"name":finding_cn_map.get(fn,fn), "level":level, "desc":"文本匹配"}
                         if fn in norm_names:
@@ -394,16 +445,6 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                             anom_c.append(item)
                     result["findings"]["anomaly_concepts"] = anom_c
                     result["findings"]["normal_concepts"] = norm_c
-
-                    # --- 生成文本 ---
-                    gen_texts = trainer.model.report_gen.generate(
-                        masked_feat_norm, _gen_cache[0],
-                        max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
-                        max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
-                    gen_text = gen_texts[0] if gen_texts else ""
-                    if gen_text:
-                        result["raw_text"] = f"医学影像AI辅助分析报告\n\n{gen_text}\n\n免责声明:\n本报告由AI辅助分析系统自动生成，仅供临床参考。"
-                        result["gen_text"] = gen_text
 
                 true_label = classnames[label[i].item()]
                 all_results.append(result)
@@ -457,7 +498,7 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                 method_name="AnomalyCLIP", dataset_name=cfg.DATASET.NAME,
                 reference_texts=all_ref_texts)
 
-    return generator
+    return all_results
 
 
 if __name__ == "__main__":

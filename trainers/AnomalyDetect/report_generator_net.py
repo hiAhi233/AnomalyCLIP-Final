@@ -270,23 +270,19 @@ class ReportGenNet(nn.Module):
                 loss_stop = loss_stop + (F.cross_entropy(
                     p_stop, prob_real[:, s].long(), reduction='none') * mask).sum()
 
-            # 词 loss (teacher forcing, 前 t 词 → 第 t+1 词)
+            # 词 loss (teacher forcing)
+            # WordLSTM 内部已做错位: 输入[topic, w0..w_{n-2}] → outputs[t] 预测 w_t
+            # 所以 outputs 与 captions 直接对齐, 不需要再 shift!
             sent = captions[:, s, :]                             # [B, n_max]
             word_mask = (sent > 0).float()
             if word_mask.sum() > 0:
                 outputs = self.word_model(topic.squeeze(1), sent)  # [B, n_max, vocab]
-                # 预测 t 位置 → 与 t+1 位置真实词对比 (错位)
-                targets = sent
-                shift_out = outputs[:, :-1, :]                   # 预测 t=0..n-2
-                shift_tgt = targets[:, 1:]                       # 真实 t=1..n-1
-                shift_mask = word_mask[:, 1:]
-                if shift_mask.sum() > 0:
-                    word_ce = F.cross_entropy(
-                        shift_out.reshape(-1, shift_out.shape[-1]),
-                        shift_tgt.reshape(-1), reduction='none')
-                    word_ce = word_ce.reshape_as(shift_mask) * shift_mask
-                    # 按有效 token 数归一化 (均值)
-                    loss_word = loss_word + word_ce.sum() / shift_mask.sum()
+                word_ce = F.cross_entropy(
+                    outputs.reshape(-1, outputs.shape[-1]),
+                    sent.reshape(-1), reduction='none')
+                word_ce = word_ce.reshape_as(word_mask) * word_mask
+                # 按有效 token 数归一化 (均值)
+                loss_word = loss_word + word_ce.sum() / word_mask.sum()
 
             prev_hidden = hidden
 

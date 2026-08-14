@@ -50,23 +50,40 @@ class Thymoma(DatasetBase):
         def _collate(ims, y, c):
             return [Datum(impath=im, label=y, classname=c) for im in ims]
 
-        train, val, test = [], [], []
+        # ---- 按患者分组 (P<id>_ 前缀), 患者级划分避免同一患者跨集泄漏 ----
+        import re
+        patient_slices = defaultdict(list)   # pid -> [(impath, label, classname)]
+        patient_labels = {}
         for label, category in enumerate(categories):
             category_dir = os.path.join(image_dir, category)
-            images = [os.path.join(category_dir, f) for f in listdir_nohidden(category_dir)
-                      if f.lower().endswith('.png')]
-            random.shuffle(images)
-            n_total = len(images)
-            n_train = max(1, round(n_total * p_trn))
-            n_val = max(1, round(n_total * p_val))
-            n_test = max(1, n_total - n_train - n_val)
+            for f in listdir_nohidden(category_dir):
+                if not f.lower().endswith('.png'):
+                    continue
+                m = re.match(r'P(\d+)_', f)
+                pid = int(m.group(1)) if m else -abs(hash(f))  # 无ID兜底: 每图独立
+                impath = os.path.join(category_dir, f)
+                patient_slices[pid].append((impath, label, category))
+                patient_labels[pid] = (label, category)
 
-            if new_cnames and category in new_cnames:
-                category = new_cnames[category]
+        pids = list(patient_slices.keys())
+        random.shuffle(pids)
+        n_total = len(pids)
+        n_train = max(1, round(n_total * p_trn))
+        n_val = max(1, round(n_total * p_val))
+        print(f"Thymoma: {n_total} 患者 → train {n_train} / val {n_val} / test {n_total - n_train - n_val}")
 
-            train.extend(_collate(images[:n_train], label, category))
-            val.extend(_collate(images[n_train:n_train + n_val], label, category))
-            test.extend(_collate(images[n_train + n_val:], label, category))
+        def _collect(pid_list):
+            out = []
+            for pid in pid_list:
+                label, cls = patient_labels[pid]
+                cname = new_cnames[cls] if (new_cnames and cls in new_cnames) else cls
+                for impath, _, _ in patient_slices[pid]:
+                    out.append(Datum(impath=impath, label=label, classname=cname))
+            return out
+
+        train = _collect(pids[:n_train])
+        val = _collect(pids[n_train:n_train + n_val])
+        test = _collect(pids[n_train + n_val:])
 
         return train, val, test
 

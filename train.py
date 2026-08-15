@@ -169,6 +169,9 @@ def extend_cfg(cfg):
     # 分组学习率: 提示词/锚点投影 (BiomedCoOp 论文值 2.5e-3) vs 生成器 LoRA (1e-4)
     cfg.TRAINER.ANOMALY_DETECT.PROMPT_LR = 0.0025
     cfg.TRAINER.ANOMALY_DETECT.GEN_LR = 0.0001
+    # 结构化征象注入 (19 维测量值 → 生成器征象词元)
+    cfg.TRAINER.ANOMALY_DETECT.STRUCT_CSV = ""
+    cfg.TRAINER.ANOMALY_DETECT.STRUCT_TOKENS = 4
 
     cfg.TRAINER.KGCOOP = CN()
     cfg.TRAINER.KGCOOP.CTX_INIT = "a photo of a"  # initialization words
@@ -190,17 +193,26 @@ def extend_cfg(cfg):
     cfg.TRAINER.PROGRAD.T = 1.
     cfg.TRAINER.PROGRAD.LAMBDA = 1.
 
+def _load_utf8_cfg(path):
+    """UTF-8 读取 yaml → CfgNode (yacs 的 merge_from_file 只支持 GBK 路径打开)"""
+    import yaml as _yaml
+    from yacs.config import CfgNode as _CN
+    with open(path, 'r', encoding='utf-8') as f:
+        d = _yaml.safe_load(f)
+    return _CN(d)
+
+
 def setup_cfg(args):
     cfg = get_cfg_default()
     extend_cfg(cfg)
 
-    # 1. From the dataset config file
+    # 1. From the dataset config file (UTF-8: 路径可能含中文, yacs 默认 GBK 会炸)
     if args.dataset_config_file:
-        cfg.merge_from_file(args.dataset_config_file)
+        cfg.merge_from_other_cfg(_load_utf8_cfg(args.dataset_config_file))
 
     # 2. From the method config file
     if args.config_file:
-        cfg.merge_from_file(args.config_file)
+        cfg.merge_from_other_cfg(_load_utf8_cfg(args.config_file))
 
     # 3. From input arguments
     reset_cfg(cfg, args)

@@ -60,7 +60,9 @@ TRAINER:
     LORA_ALPHA: 8
     LORA_DROPOUT: 0.1
     VIS_TOKENS: 64
-    GEN_MAX_TOKENS: 120
+    GEN_MAX_TOKENS: 110
     GEN_TEMPERATURE: 0.4
     PROMPT_LR: 0.0025
     GEN_LR: 0.0001
+    STRUCT_CSV: "D:/图神经网络/异常检测/代码demo3/数据集2/胸腺区占位/胸腺区占位_AI3.csv"
+    STRUCT_TOKENS: 4

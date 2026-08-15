@@ -1,12 +1,12 @@
 """
 report_generator_qwen.py — Qwen2.5-0.5B 医学报告生成器 (多视觉词元版)
 ================================================================
-LLaVA 模式: 不是 1 个全局向量, 而是把 196 个 patch 特征投影后
-按空间布局池化成 K 个视觉词元 (默认 64 = 8x8), 拼在文本 token 前面。
-生成器由此拥有空间信息 (病灶位置/大小/纹理), 从信息量上根治"背书"。
+LLaVA 模式: 196 个 patch 特征按空间布局池化成 K 个视觉词元 (默认 64 = 8x8),
+另有 19 维结构化征象经 MLP 投影成 K2 个征象词元, 拼在文本 token 前面。
+生成器由此拥有空间信息 + 征象信息 (大小/强化/钙化)。
 
 训练: LoRA 微调 (默认 r=4, 只训投影层 + LoRA 适配器, 冻结主干)
-推理: 离线自回归生成 + 停止词截断 (遇"手术/病理/免疫组化"即停)
+推理: 离线自回归生成 + 停止词截断 + 诊断意见首句收尾
 """
 
 import os
@@ -17,8 +17,9 @@ import torch.nn.functional as F
 
 class QwenReportGenerator(nn.Module):
     def __init__(self, model_path='models/qwen2.5-0.5b', patch_dim=768,
-                 vis_tokens=64, lora_r=4, lora_alpha=8, lora_dropout=0.1,
-                 max_length=256, gen_max_tokens=120, temperature=0.4,
+                 vis_tokens=64, struct_dim=19, struct_tokens=4,
+                 lora_r=4, lora_alpha=8, lora_dropout=0.1,
+                 max_length=256, gen_max_tokens=110, temperature=0.4,
                  stop_words=("手术", "病理", "免疫组化", "Assistant", "病史"), device=None):
         super().__init__()
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -28,6 +29,8 @@ class QwenReportGenerator(nn.Module):
         self.stop_words = stop_words
         self.vis_tokens = vis_tokens
         self.grid = int(vis_tokens ** 0.5)  # 64 → 8x8
+        self.struct_dim = struct_dim
+        self.struct_tokens = struct_tokens
 
         # ---- 加载 Qwen (bf16, 冻结主干) ----
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -44,6 +47,14 @@ class QwenReportGenerator(nn.Module):
         # ---- 视觉投影层 (可训练, bf16 对齐 Qwen) ----
         self.visual_proj = nn.Sequential(
             nn.Linear(patch_dim, self.embed_dim),
+        ).to(self.device).bfloat16()
+
+        # ---- 结构化征象投影: 19 维测量值 → K 个征象词元 ----
+        # (大小/CT值/强化/钙化等 — 报告句子的内容来源, 治尺寸编造)
+        self.struct_proj = nn.Sequential(
+            nn.Linear(struct_dim, self.embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.embed_dim * 2, self.embed_dim * struct_tokens),
         ).to(self.device).bfloat16()
 
         # ---- LoRA 适配器 (默认 r=4, 容量受限 → 治背诵) ----
@@ -69,29 +80,37 @@ class QwenReportGenerator(nn.Module):
         pooled = F.adaptive_avg_pool2d(proj, (self.grid, self.grid))  # [B, D, g, g]
         return pooled.flatten(2).permute(0, 2, 1)            # [B, K, D]
 
+    def _struct_emb(self, struct_feat):
+        """struct_feat: [B, 19] 标准化后的结构化征象 → [B, K, D]"""
+        proj = self.struct_proj(struct_feat.bfloat16())            # [B, K*D]
+        return proj.view(-1, self.struct_tokens, self.embed_dim)  # [B, K, D]
+
     # ----------------------------------------------------------
-    # 教师强制训练: 视觉词元 + 报告 token → 下一个 token 预测
+    # 教师强制训练: [视觉词元 | 征象词元 | 报告 token] → 下一个 token
     # ----------------------------------------------------------
-    def forward(self, visual_patches, input_ids, attention_mask):
+    def forward(self, visual_patches, struct_feat, input_ids, attention_mask):
         """
-        visual_patches: [B, 196, 768]  BiomedCLIP trunk 原始 patch token
+        visual_patches: [B, 196, 768]  trunk 原始 patch token (全图, 不再用掩膜图)
+        struct_feat:    [B, 19]        结构化征象 (标准化后)
         input_ids:      [B, L]         报告 token 序列 (非代表层 → 全 pad)
         attention_mask: [B, L]         非代表层 → 全 0
         Returns: 标量交叉熵 (全批无报告时返回零)
         """
         B = visual_patches.shape[0]
 
-        vis_emb = self._visual_emb(visual_patches)           # [B, K, D]
-        text_emb = self.qwen.get_input_embeddings()(input_ids)  # [B, L, D]
+        vis_emb = self._visual_emb(visual_patches)                # [B, V, D]
+        struct_emb = self._struct_emb(struct_feat)                # [B, K, D]
+        text_emb = self.qwen.get_input_embeddings()(input_ids)   # [B, L, D]
 
-        inputs_embeds = torch.cat([vis_emb, text_emb], dim=1)   # [B, K+L, D]
-        vis_mask = torch.ones(B, vis_emb.shape[1], dtype=attention_mask.dtype, device=self.device)
-        attn = torch.cat([vis_mask, attention_mask], dim=1)     # [B, K+L]
+        inputs_embeds = torch.cat([vis_emb, struct_emb, text_emb], dim=1)
+        n_pre = vis_emb.shape[1] + struct_emb.shape[1]
+        pre_mask = torch.ones(B, n_pre, dtype=attention_mask.dtype, device=self.device)
+        attn = torch.cat([pre_mask, attention_mask], dim=1)
 
         labels = input_ids.clone()
         labels[attention_mask == 0] = -100
         labels = torch.cat([
-            torch.full((B, vis_emb.shape[1]), -100, dtype=labels.dtype, device=self.device),
+            torch.full((B, n_pre), -100, dtype=labels.dtype, device=self.device),
             labels], dim=1)
 
         # 全批都是非代表层 (无报告): 返回零损失, 保持梯度图连通
@@ -102,12 +121,13 @@ class QwenReportGenerator(nn.Module):
         return outputs.loss
 
     # ----------------------------------------------------------
-    # 推理: 图像 → 报告 (带停止词截断, 防病理幻觉)
+    # 推理: 图像 + 征象 → 报告 (带停止词截断, 防病理幻觉)
     # ----------------------------------------------------------
     @torch.no_grad()
-    def generate(self, visual_patches, max_new_tokens=None, temperature=None):
+    def generate(self, visual_patches, struct_feat, max_new_tokens=None, temperature=None):
         """
         visual_patches: [B, 196, 768]
+        struct_feat:    [B, 19]
         Returns: list[str]
         """
         self.qwen.eval()
@@ -115,18 +135,19 @@ class QwenReportGenerator(nn.Module):
         max_new_tokens = max_new_tokens or self.gen_max_tokens
         temperature = temperature if temperature is not None else self.temperature
 
-        vis_emb = self._visual_emb(visual_patches)            # [B, K, D]
-        vis_mask = torch.ones(B, vis_emb.shape[1], dtype=torch.long, device=self.device)
+        vis_emb = self._visual_emb(visual_patches)                # [B, V, D]
+        struct_emb = self._struct_emb(struct_feat)                # [B, K, D]
+        n_pre = vis_emb.shape[1] + struct_emb.shape[1]
+        pre_mask = torch.ones(B, n_pre, dtype=torch.long, device=self.device)
 
         # 直启式提示: 给报告起始语让模型续写, 避免 Qwen 进入聊天模式
-        # (旧提示"请根据..."会触发 Assistant 回复格式)
         prompt = "影像所见："
         prompt_ids = self.tokenizer(prompt, return_tensors='pt')['input_ids'].to(self.device)
         prompt_emb = self.qwen.get_input_embeddings()(prompt_ids).repeat(B, 1, 1)
         prompt_mask = torch.ones(B, prompt_emb.shape[1], dtype=torch.long, device=self.device)
 
-        inputs_embeds = torch.cat([vis_emb, prompt_emb], dim=1)
-        attn = torch.cat([vis_mask, prompt_mask], dim=1)
+        inputs_embeds = torch.cat([vis_emb, struct_emb, prompt_emb], dim=1)
+        attn = torch.cat([pre_mask, prompt_mask], dim=1)
 
         out_ids = self.qwen.generate(
             inputs_embeds=inputs_embeds, attention_mask=attn,
@@ -136,13 +157,22 @@ class QwenReportGenerator(nn.Module):
             pad_token_id=self.tokenizer.eos_token_id,
         )
         texts = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
-        # 截断: 遇病理段标记即停 (训练文本只含影像所见+诊断意见)
+        # 截断策略:
+        #   1) 遇病理段标记即停 (训练文本只含影像所见+诊断意见)
+        #   2) 保留到"诊断意见"第一句的句号为止 — 所见+意见完整, 其后漂移全丢
         cleaned = []
         for t in texts:
             for sw in self.stop_words:
                 i = t.find(sw)
                 if i > 0:
                     t = t[:i]
+            j = t.find('诊断意见')
+            if j >= 0:
+                k = t.find('。', j)
+                t = t[:k + 1] if k > 0 else t[:j]
+            else:
+                k = t.rfind('。')
+                t = t[:k + 1] if k > 0 else t
             cleaned.append(t.strip())
         return cleaned
 
@@ -161,17 +191,18 @@ if __name__ == '__main__':
     # 训练模式自测
     B, L = 2, 32
     patches = torch.randn(B, 196, 768).to(gen.device)
+    struct = torch.randn(B, 19).to(gen.device)
     ids = torch.randint(100, 1000, (B, L)).to(gen.device)
     mask = torch.ones(B, L, dtype=torch.long).to(gen.device)
-    loss = gen(patches, ids, mask)
+    loss = gen(patches, struct, ids, mask)
     print(f'train loss: {loss.item():.4f}')
     loss.backward()
     print('forward+backward OK')
 
     # 全空批自测 (非代表层)
-    loss0 = gen(patches, ids, torch.zeros_like(mask))
+    loss0 = gen(patches, struct, ids, torch.zeros_like(mask))
     print(f'empty-batch loss: {loss0.item():.4f}')
 
     # 推理自测
-    texts = gen.generate(patches[:1], max_new_tokens=50)
+    texts = gen.generate(patches[:1], struct[:1], max_new_tokens=50)
     print(f'generated: {texts[0][:200]}')

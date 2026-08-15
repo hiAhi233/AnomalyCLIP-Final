@@ -268,6 +268,32 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                         real_refs[pid] = fp.read().strip()
     print(f"  加载了 {len(real_refs)} 份真实报告作为 NLG 参考")
 
+    # ---- 结构化征象查询表 (与训练侧同逻辑: 19维标准化) ----
+    import torch as _torch
+    _struct_map = {}
+    _csv_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'STRUCT_CSV', '')
+    if _csv_path and os.path.exists(_csv_path):
+        import pandas as _pd
+        from sklearn.preprocessing import StandardScaler as _SS
+        _df = _pd.read_csv(_csv_path)
+        _df['影像号'] = _df['影像号'].astype(int)
+        _NUM_F = ['长径mm', '短径mm', '年龄', '胸大肌平扫密度CT值', '肿块平扫密度CT值',
+                  '病变动脉期CT值', '病变静脉期CT值', 'AFP', 'HCG', 'LDH', 'HCT红细胞压积']
+        _CAT_F = ['性别', '钙化', '形态', '边缘边界', '囊变坏死', '周围情况', '增强情况', '偏侧性']
+        _X = _pd.DataFrame()
+        for _c in _NUM_F:
+            _X[_c] = _pd.to_numeric(_df[_c], errors='coerce')
+        for _c in _CAT_F:
+            _X[_c] = _df[_c].astype(str).astype('category').cat.codes
+        _X = _X.fillna(_X.median())
+        _Xs = _SS().fit(_X.values).transform(_X.values)
+        for _i, _row in _df.iterrows():
+            _struct_map[int(_row['影像号'])] = _torch.tensor(_Xs[_i], dtype=_torch.float)
+        print(f"  加载结构化征象: {len(_struct_map)} 患者")
+
+    def _struct_lookup(pid):
+        return _struct_map.get(pid, _torch.zeros(19))
+
     # 读 split JSON 获取测试集路径→患者ID映射
     split_path = os.path.join(data_dir, f"split_{cfg.DATASET.NAME}.json")
     test_paths = []
@@ -386,15 +412,18 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                     print(f'[DEBUG] gen_mode={gen_mode} has_report_gen={hasattr(trainer.model, "report_gen")}')
                 if gen_mode and hasattr(trainer.model, 'report_gen'):
                     gen_backend = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_BACKEND', 'qwen')
-                    masked_img = single_outputs[4]
-                    masked_feat, masked_patches = trainer.model._extract_patch_tokens(masked_img)
-                    masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
 
                     # --- ① 先用生成器写报告文本 (qwen / lstm 接口不同) ---
                     if gen_backend == 'qwen':
-                        # 多视觉词元版: 传 patch token 序列 (生成器内部含截断/温度)
-                        gen_texts = trainer.model.report_gen.generate(masked_patches)
+                        # 全图 patch (去掩膜) + 结构化征象 → 报告
+                        full_patches = trainer.model._extract_patch_tokens(image[i:i+1])[1]
+                        struct = _struct_lookup(pid)   # [19] 标准化征象
+                        gen_texts = trainer.model.report_gen.generate(
+                            full_patches, struct.unsqueeze(0).to(trainer.device))
                     else:
+                        masked_img = single_outputs[4]
+                        masked_feat, masked_patches = trainer.model._extract_patch_tokens(masked_img)
+                        masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
                         if _gen_cache[0] is None:
                             import pickle as _pkl
                             vp = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', 'data/Thymoma/vocab.pkl')
@@ -405,32 +434,34 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                             max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
                             max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
                     gen_text = gen_texts[0] if gen_texts else ""
+                    # 清理 tokenizer 解码残渣 (U+FFFD 等, GBK 日志写不了)
+                    gen_text = gen_text.replace('�', '').strip()
                     if gen_text:
                         result["raw_text"] = f"医学影像AI辅助分析报告\n\n{gen_text}\n\n免责声明:\n本报告由AI辅助分析系统自动生成，仅供临床参考。"
                         result["gen_text"] = gen_text
 
-                    # --- ② 从生成文本提取 CE 征象 (否定过滤关键词匹配) ---
-                    finding_order = ["tumor_mass", "inflammation", "necrosis", "calcification",
-                                     "cyst_fluid", "fibrosis_scar", "normal_tissue",
-                                     "regular_architecture", "isoechoic_texture"]
+                    # --- ② 从生成文本提取 CE 征象 (否定过滤关键词匹配, CT 纵隔版) ---
+                    finding_order = ["tumor_mass", "enhancement", "necrosis", "calcification",
+                                     "cystic_change", "lobulation", "fat_density",
+                                     "lymphadenopathy", "pleural_effusion"]
                     finding_keywords = {
-                        "tumor_mass": ["肿块","占位","结节","肿物","软组织影","团块"],
-                        "inflammation": ["炎性","炎症","炎变","感染"],
+                        "tumor_mass": ["肿块","占位","结节","肿物","软组织影","团块","病灶"],
+                        "enhancement": ["强化","增强"],
                         "necrosis": ["坏死","液化"],
                         "calcification": ["钙化","钙灶"],
-                        "cyst_fluid": ["囊肿","囊性","囊变","囊状","液性"],
-                        "fibrosis_scar": ["纤维","瘢痕","条索"],
-                        "normal_tissue": ["未见异常","未见明确","未见明显","正常","清晰","无异常"],
-                        "regular_architecture": ["规则","规整","光整","清晰","分界清","边界清"],
-                        "isoechoic_texture": ["均匀","一致","密度均匀"],
+                        "cystic_change": ["囊肿","囊性","囊变","囊状","液性"],
+                        "lobulation": ["分叶"],
+                        "fat_density": ["脂肪密度","脂性","脂质"],
+                        "lymphadenopathy": ["淋巴结"],
+                        "pleural_effusion": ["胸腔积液","积液","胸水"],
                     }
                     negation_words = ["未见","未发现","无明显","未见明确","未见明显","排除",
                                       "不除外","不考虑","未见异常","无异常","无明确","未见肿物","无肿物"]
                     finding_cn_map = {
-                        "tumor_mass": "实性占位征象","inflammation":"炎性改变征象","necrosis":"坏死液化征象",
-                        "calcification":"钙化灶征象","cyst_fluid":"囊性结构征象","fibrosis_scar":"纤维化/瘢痕征象",
-                        "normal_tissue":"正常组织回声/密度","regular_architecture":"结构规整性","isoechoic_texture":"质地均匀性"}
-                    norm_names={"normal_tissue","regular_architecture","isoechoic_texture"}
+                        "tumor_mass": "实性占位征象","enhancement":"强化征象","necrosis":"坏死液化征象",
+                        "calcification":"钙化灶征象","cystic_change":"囊变征象","lobulation":"分叶征象",
+                        "fat_density":"脂肪密度征象","lymphadenopathy":"淋巴结征象","pleural_effusion":"胸腔积液征象"}
+                    norm_names = set()
                     anom_c, norm_c = [], []
                     for fn in finding_order:
                         kws = finding_keywords.get(fn, [])

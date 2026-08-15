@@ -31,43 +31,55 @@ except ImportError:
 # ============================================================
 
 ALL_FINDINGS = [
-    "tumor_mass", "inflammation", "necrosis",
-    "calcification", "cyst_fluid", "fibrosis_scar",
-    "normal_tissue", "regular_architecture", "isoechoic_texture",
+    "tumor_mass", "enhancement", "necrosis", "calcification",
+    "cystic_change", "lobulation", "fat_density",
+    "lymphadenopathy", "pleural_effusion",
 ]
 
 FINDING_CN = {
     "tumor_mass": "实性占位征象",
-    "inflammation": "炎性改变征象",
+    "enhancement": "强化征象",
     "necrosis": "坏死液化征象",
     "calcification": "钙化灶征象",
-    "cyst_fluid": "囊性结构征象",
-    "fibrosis_scar": "纤维化/瘢痕征象",
-    "normal_tissue": "正常组织回声",
-    "regular_architecture": "结构规整性",
-    "isoechoic_texture": "等回声质地",
+    "cystic_change": "囊变征象",
+    "lobulation": "分叶征象",
+    "fat_density": "脂肪密度征象",
+    "lymphadenopathy": "淋巴结征象",
+    "pleural_effusion": "胸腔积液征象",
 }
 
-# 标签 → 期望征象（按关键词匹配，数据集无关）
+# 标签 → 期望征象 (CT 纵隔占位, 按病理类别)
 def _get_expected_findings(label: str) -> dict:
-    """根据标签关键词返回期望征象向量"""
+    """根据标签返回期望征象向量"""
     low = label.lower()
-    if any(kw in low for kw in ("malignant", "cancer", "carcinoma")):
-        return {"tumor_mass": +1, "inflammation": +1, "necrosis": +1,
-                "calcification": 0, "cyst_fluid": 0, "fibrosis_scar": 0,
-                "normal_tissue": -1, "regular_architecture": -1, "isoechoic_texture": -1}
-    if any(kw in low for kw in ("thymoma", "tumor", "neoplasm")):
-        return {"tumor_mass": +1, "inflammation": 0, "necrosis": 0,
-                "calcification": +1, "cyst_fluid": 0, "fibrosis_scar": 0,
-                "normal_tissue": -1, "regular_architecture": -1, "isoechoic_texture": -1}
-    if "benign" in low:
-        return {"tumor_mass": +1, "inflammation": 0, "necrosis": 0,
-                "calcification": 0, "cyst_fluid": 0, "fibrosis_scar": 0,
-                "normal_tissue": +1, "regular_architecture": +1, "isoechoic_texture": 0}
-    if "normal" in low:
-        return {"tumor_mass": -1, "inflammation": -1, "necrosis": -1,
-                "calcification": -1, "cyst_fluid": -1, "fibrosis_scar": -1,
-                "normal_tissue": +1, "regular_architecture": +1, "isoechoic_texture": +1}
+    if "thymic_carcinoma" in low or "other_malignant" in low:
+        return {"tumor_mass": +1, "enhancement": +1, "necrosis": +1, "calcification": 0,
+                "cystic_change": 0, "lobulation": +1, "fat_density": 0,
+                "lymphadenopathy": +1, "pleural_effusion": +1}
+    if "thymoma" in low:
+        return {"tumor_mass": +1, "enhancement": +1, "necrosis": 0, "calcification": +1,
+                "cystic_change": 0, "lobulation": 0, "fat_density": 0,
+                "lymphadenopathy": 0, "pleural_effusion": 0}
+    if "lymphoma" in low:
+        return {"tumor_mass": +1, "enhancement": +1, "necrosis": +1, "calcification": 0,
+                "cystic_change": 0, "lobulation": +1, "fat_density": 0,
+                "lymphadenopathy": +1, "pleural_effusion": +1}
+    if "teratoma" in low or "germ_cell" in low:
+        return {"tumor_mass": +1, "enhancement": 0, "necrosis": 0, "calcification": +1,
+                "cystic_change": +1, "lobulation": 0, "fat_density": +1,
+                "lymphadenopathy": 0, "pleural_effusion": 0}
+    if "cyst" in low:
+        return {"tumor_mass": 0, "enhancement": 0, "necrosis": 0, "calcification": 0,
+                "cystic_change": +1, "lobulation": 0, "fat_density": 0,
+                "lymphadenopathy": 0, "pleural_effusion": 0}
+    if "metastasis" in low:
+        return {"tumor_mass": +1, "enhancement": +1, "necrosis": +1, "calcification": 0,
+                "cystic_change": 0, "lobulation": +1, "fat_density": 0,
+                "lymphadenopathy": +1, "pleural_effusion": +1}
+    if "neuroendocrine" in low or "hyperplasia" in low or "benign_lesion" in low:
+        return {"tumor_mass": +1, "enhancement": +1, "necrosis": 0, "calcification": 0,
+                "cystic_change": 0, "lobulation": 0, "fat_density": 0,
+                "lymphadenopathy": 0, "pleural_effusion": 0}
     # 未知标签：全中性
     return {f: 0 for f in ALL_FINDINGS}
 

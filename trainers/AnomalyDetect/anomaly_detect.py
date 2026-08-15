@@ -113,25 +113,43 @@ class AnomalyCLIP(nn.Module):
         self.bg_factor = getattr(cfg.TRAINER.ANOMALY_DETECT, 'BG_FACTOR', 0.3)
         # ---- dual-stream fusion ----
         self.lambda_fusion = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_FUSION', 0.7)
-        # ---- report generator (Vinyals-style hierarchical LSTM) ----
+        # ---- report generator ----
+        # gen_backend: "qwen" (预训练语言模型, 推荐) | "lstm" (层级LSTM, 旧版)
         self.gen_mode = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_MODE', False)
+        self.gen_backend = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_BACKEND', 'qwen')
         self.lambda_tag = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_TAG', 0.5)
         self.lambda_stop = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_STOP', 0.5)
         self.lambda_word = getattr(cfg.TRAINER.ANOMALY_DETECT, 'LAMBDA_WORD', 1.0)
         if self.gen_mode:
-            from trainers.AnomalyDetect.report_generator_net import ReportGenNet
-            vocab_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', '')
-            vocab_size = 1008  # fallback (thymoma corpus default)
-            if vocab_path and os.path.exists(vocab_path):
-                import pickle as _pkl
-                with open(vocab_path, 'rb') as f:
-                    vocab_size = len(_pkl.load(f))
-            self.report_gen = ReportGenNet(
-                vocab_size=vocab_size,
-                s_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
-                n_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50),
-            )
-            print(f'Report generator initialized: vocab={vocab_size}')
+            if self.gen_backend == 'qwen':
+                from trainers.AnomalyDetect.report_generator_qwen import QwenReportGenerator
+                qwen_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'QWEN_PATH',
+                                    'models/qwen2.5-0.5b')
+                self.report_gen = QwenReportGenerator(
+                    model_path=qwen_path,
+                    patch_dim=768,   # trunk 原始 patch 特征空间
+                    vis_tokens=getattr(cfg.TRAINER.ANOMALY_DETECT, 'VIS_TOKENS', 64),
+                    lora_r=getattr(cfg.TRAINER.ANOMALY_DETECT, 'LORA_R', 4),
+                    lora_alpha=getattr(cfg.TRAINER.ANOMALY_DETECT, 'LORA_ALPHA', 8),
+                    lora_dropout=getattr(cfg.TRAINER.ANOMALY_DETECT, 'LORA_DROPOUT', 0.1),
+                    gen_max_tokens=getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_MAX_TOKENS', 120),
+                    temperature=getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_TEMPERATURE', 0.4),
+                )
+                print(f'Report generator (Qwen2.5-0.5B, {getattr(cfg.TRAINER.ANOMALY_DETECT, "VIS_TOKENS", 64)} 视觉词元, LoRA r={getattr(cfg.TRAINER.ANOMALY_DETECT, "LORA_R", 4)}) initialized from {qwen_path}')
+            else:
+                from trainers.AnomalyDetect.report_generator_net import ReportGenNet
+                vocab_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', '')
+                vocab_size = 1008  # fallback (thymoma corpus default)
+                if vocab_path and os.path.exists(vocab_path):
+                    import pickle as _pkl
+                    with open(vocab_path, 'rb') as f:
+                        vocab_size = len(_pkl.load(f))
+                self.report_gen = ReportGenNet(
+                    vocab_size=vocab_size,
+                    s_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
+                    n_max=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50),
+                )
+                print(f'Report generator (LSTM) initialized: vocab={vocab_size}')
         self.anomaly_indices = list(range(n_cls - 1))
 
     # ---- anchor encoding (shared with original) ----
@@ -171,7 +189,7 @@ class AnomalyCLIP(nn.Module):
             s = s_img.mean().item()
         else:
             s = float(s_img)
-        if s < 0.2:
+        if s < 0.05:  # 原始特征空间: 正常 s_img≈0.0 (旧标定 0.2 针对饱和分数)
             lam = min(lam, 0.3)
         return lam
 
@@ -189,8 +207,9 @@ class AnomalyCLIP(nn.Module):
         logits_full = logit_scale * image_features_norm @ text_features.t()
 
         # ---- Path B (anomaly detection) ----
-        patch_features = self.patch_proj(patch_tokens)      # [B, 196, 768]
-        patch_features = patch_features / patch_features.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        # 注意: 记忆库/文本锚点存的是 trunk 原始 patch 特征, 这里直接比较原始特征,
+        # 不再过 patch_proj (投影后的空间与库不一致 → s_img 饱和 0.99 的根因)
+        patch_features = patch_tokens / patch_tokens.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
         if self.memory_bank is not None:
             # Memory Bank mode: distance to nearest normal patch
@@ -227,7 +246,7 @@ class AnomalyCLIP(nn.Module):
             mask_224 = F.interpolate(mask_2d, size=224, mode='bilinear')  # [B, 1, 224, 224]
 
             # suppress background, keep lesion region
-            apply = s_img > 0.4
+            apply = s_img > 0.1  # 原始特征空间距离: 正常≈0, 病灶 0.1~0.25 (0.4 是旧投影空间的标定)
             if apply.any():
                 bg_suppressed = image * (mask_224 + self.bg_factor * (1 - mask_224))
                 masked_image = torch.where(apply.view(-1,1,1,1), bg_suppressed, image)
@@ -286,15 +305,24 @@ class AnomalyCLIP(nn.Module):
             # ---- report generation branch (teacher forcing) ----
             gen_losses = None
             if self.gen_mode and captions is not None:
-                # 病灶聚焦全局特征 (masked 流) 作为生成器视觉输入
-                masked_feat, _ = self._extract_patch_tokens(masked_image)
+                # 病灶聚焦流的 patch 特征 (masked 流) 作为生成器视觉输入
+                # Qwen: 196 个 patch token → 多视觉词元 (空间信息可读)
+                masked_feat, masked_patches = self._extract_patch_tokens(masked_image)
                 masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
-                gen_losses = self.report_gen(
-                    masked_feat_norm, captions, prob_real, tag_target)
-                loss_ce = loss_ce \
-                    + self.lambda_tag * gen_losses['loss_tag'] \
-                    + self.lambda_stop * gen_losses['loss_stop'] \
-                    + self.lambda_word * gen_losses['loss_word']
+                if self.gen_backend == 'qwen':
+                    # Qwen: 输入 patch token 序列 + 报告 token, 输出标量 loss
+                    # (非代表层全 pad → 批内自动不计损失)
+                    gen_loss = self.report_gen(
+                        masked_patches, captions, prob_real)
+                    gen_losses = {'loss_word': gen_loss}
+                    loss_ce = loss_ce + self.lambda_word * gen_loss
+                else:
+                    gen_losses = self.report_gen(
+                        masked_feat_norm, captions, prob_real, tag_target)
+                    loss_ce = loss_ce \
+                        + self.lambda_tag * gen_losses['loss_tag'] \
+                        + self.lambda_stop * gen_losses['loss_stop'] \
+                        + self.lambda_word * gen_losses['loss_word']
 
             return logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img, gen_losses
         else:
@@ -317,13 +345,16 @@ class ThymomaReportWrapper(DasslWrapper):
     """标准 Dassl wrapper + 报告 token (患者 ID → captions.json / thymoma_tags.json)"""
 
     def __init__(self, cfg, data_source, transform=None, is_train=False,
-                 vocab=None, captions=None, tags=None, s_max=8, n_max=50):
+                 vocab=None, captions=None, tags=None, s_max=8, n_max=50,
+                 tokenizer=None, qwen_backend=False):
         super().__init__(cfg, data_source, transform, is_train)
         self.vocab = vocab
         self.captions = captions      # {image_name: report_text}
         self.tags = tags              # {pid_str: {finding: 0/1}}
         self.s_max = s_max
         self.n_max = n_max
+        self.tokenizer = tokenizer    # Qwen tokenizer (qwen 模式)
+        self.qwen_backend = qwen_backend
 
     def __getitem__(self, idx):
         output = super().__getitem__(idx)
@@ -331,36 +362,48 @@ class ThymomaReportWrapper(DasslWrapper):
 
         # 从图像名解析患者 ID + 报告
         m = re.search(r'P(\d+)_', os.path.basename(impath))
-        if not m:
-            return output
-        pid = m.group(1)
+        pid = m.group(1) if m else "0"
         report = self.captions.get(os.path.basename(impath), "") if self.captions else ""
-        if not report:
-            return output
+        # 注意: captions 只挂代表层 → 非代表层 report 为空, 但仍要输出
+        # 统一形状的 captions/prob_real (默认 collate 要求所有 item key 一致),
+        # 空报告 → 全 pad + mask 0 → Qwen 侧 labels 全 -100, 不计损失
 
-        # 分句 → token 序列 [s_max, n_max] + 真实句子标记 [s_max]
-        try:
-            import jieba
-            def _tok(s):
-                toks = list(jieba.cut(s))
-                return [t for t in toks if t.strip() and t not in "，。、；：？！（）【】《》…—·"]
-        except ImportError:
-            def _tok(s):
-                return list(s)
+        if self.qwen_backend:
+            # ---- Qwen 模式: 整段报告直接 tokenize (空报告 → 全 pad) ----
+            if report:
+                enc = self.tokenizer(
+                    report, truncation=True, max_length=256,
+                    padding='max_length', return_tensors='pt')
+                output["captions"] = enc['input_ids'][0]        # [256]
+                output["prob_real"] = enc['attention_mask'][0]  # [256] (当 mask 用)
+            else:
+                pad_id = self.tokenizer.pad_token_id
+                output["captions"] = torch.full((256,), pad_id, dtype=torch.long)
+                output["prob_real"] = torch.zeros(256, dtype=torch.long)
+        else:
+            # ---- LSTM 模式: 分句 → token 序列 ----
+            try:
+                import jieba
+                def _tok(s):
+                    toks = list(jieba.cut(s))
+                    return [t for t in toks if t.strip() and t not in "，。、；：？！（）【】《》…—·"]
+            except ImportError:
+                def _tok(s):
+                    return list(s)
 
-        sentences = [s for s in report.replace("\n", "").split("。") if len(s) > 1]
-        sentences = sentences[:self.s_max]
+            padded = torch.zeros(self.s_max, self.n_max, dtype=torch.long)
+            prob_real = torch.zeros(self.s_max, dtype=torch.long)
+            if report:
+                sentences = [s for s in report.replace("\n", "").split("。") if len(s) > 1]
+                sentences = sentences[:self.s_max]
+                for i, sent in enumerate(sentences):
+                    words = _tok(sent)[:self.n_max - 2]
+                    toks = [self.vocab('<start>')] + [self.vocab(w) for w in words] + [self.vocab('<end>')]
+                    padded[i, :len(toks)] = torch.tensor(toks[:self.n_max], dtype=torch.long)
+                    prob_real[i] = 1
+            output["captions"] = padded
+            output["prob_real"] = prob_real
 
-        padded = torch.zeros(self.s_max, self.n_max, dtype=torch.long)
-        prob_real = torch.zeros(self.s_max, dtype=torch.long)
-        for i, sent in enumerate(sentences):
-            words = _tok(sent)[:self.n_max - 2]
-            toks = [self.vocab('<start>')] + [self.vocab(w) for w in words] + [self.vocab('<end>')]
-            padded[i, :len(toks)] = torch.tensor(toks[:self.n_max], dtype=torch.long)
-            prob_real[i] = 1
-
-        output["captions"] = padded
-        output["prob_real"] = prob_real
         output["tags"] = torch.tensor(
             [self.tags.get(pid, {}).get(f, 0) for f in _GEN_FINDINGS],
             dtype=torch.float) if self.tags else torch.zeros(len(_GEN_FINDINGS))
@@ -401,22 +444,36 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         if not tags_path:
             tags_path = os.path.join(data_dir, 'thymoma_tags.json')
 
-        with open(vocab_path, 'rb') as f:
-            self.vocab = _pkl.load(f)
         with open(captions_path, 'r', encoding='utf-8') as f:
             captions = json.load(f)
         tags = {}
         if os.path.exists(tags_path):
             with open(tags_path, 'r', encoding='utf-8') as f:
                 tags = json.load(f)
-        print(f'[ReportGen] vocab={len(self.vocab)} captions={len(captions)} tags={len(tags)}')
 
         s_max = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8)
         n_max = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50)
 
+        # Qwen 后端: 报告直接 tokenize, 不需要 vocab 分句
+        gen_backend = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'GEN_BACKEND', 'qwen')
+        qwen_tok = None
+        if gen_backend == 'qwen':
+            from transformers import AutoTokenizer as _AT
+            qwen_path = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'QWEN_PATH',
+                                'models/qwen2.5-0.5b')
+            qwen_tok = _AT.from_pretrained(qwen_path, trust_remote_code=True)
+            qwen_tok.pad_token = qwen_tok.eos_token
+            self.vocab = None
+            print(f'[ReportGen] Qwen tokenizer loaded from {qwen_path}')
+        else:
+            with open(vocab_path, 'rb') as f:
+                self.vocab = _pkl.load(f)
+        print(f'[ReportGen] captions={len(captions)} tags={len(tags)}')
+
         # ---- 重建训练 loader (带报告) ----
         wrapper_cls = partial(ThymomaReportWrapper, vocab=self.vocab,
-                              captions=captions, tags=tags, s_max=s_max, n_max=n_max)
+                              captions=captions, tags=tags, s_max=s_max, n_max=n_max,
+                              tokenizer=qwen_tok, qwen_backend=(gen_backend == 'qwen'))
         # 从 dm 内部取训练 transform (DataManager 未暴露, 用 _ 前缀属性)
         tfm_train = getattr(self.dm, 'tfm_train', None)
         if tfm_train is None:
@@ -449,7 +506,7 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
 
         self.model = AnomalyCLIP(cfg, classnames, bclip.eval(), tdescs)
 
-        names_to_update = ["prompt_learner.ctx", "patch_proj", "text_to_patch", "report_gen"]
+        names_to_update = ["prompt_learner.ctx", "text_to_patch", "report_gen"]
         for n, p in self.model.named_parameters():
             p.requires_grad_(any(x in n for x in names_to_update))
 
@@ -460,7 +517,27 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        # ---- 分组学习率: 提示词按论文值, LoRA/投影按 LoRA 安全值 ----
+        # (共享单 lr 时被迫取保守值 1e-4, 分类收敛不动; 分组后各自用文献验证值)
+        prompt_lr = float(getattr(cfg.TRAINER.ANOMALY_DETECT, 'PROMPT_LR', 0.0025))
+        gen_lr = float(getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_LR', 0.0001))
+        prompt_params, gen_params = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'prompt_learner' in n or 'text_to_patch' in n:
+                prompt_params.append(p)
+            elif 'report_gen' in n:
+                gen_params.append(p)
+            else:
+                prompt_params.append(p)
+        wd = float(getattr(cfg.OPTIM, 'WEIGHT_DECAY', 0.0005))
+        self.optim = torch.optim.Adam([
+            {"params": prompt_params, "lr": prompt_lr},
+            {"params": gen_params, "lr": gen_lr},
+        ], weight_decay=wd)
+        print(f'Optimizer: Adam 分组 — 提示词/锚点 lr={prompt_lr} ({len(prompt_params)} params), '
+              f'生成器 lr={gen_lr} ({len(gen_params)} params)')
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model('anomaly_clip', self.model, self.optim, self.sched)
         self.total_epochs = cfg.OPTIM.MAX_EPOCH
@@ -493,7 +570,15 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
             gen_losses = out[6] if len(out) > 6 else None
             loss = loss_ce + loss_sccm + loss_kdsp + loss_consist
 
-            self.model_backward_and_update(loss)
+            # Qwen fp16 梯度容易溢出 → 训练前裁剪生成器梯度
+            if getattr(self.model, 'gen_backend', '') == 'qwen':
+                self.optim.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.report_gen.parameters(), max_norm=1.0)
+                self.optim.step()
+            else:
+                self.model_backward_and_update(loss)
 
         ret = {"loss": loss.item(),
                "loss_ce": loss_ce.item(), "loss_consist": loss_consist.item(),
@@ -502,6 +587,12 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         if gen_losses is not None:
             for k, v in gen_losses.items():
                 ret[f"gen_{k}"] = v.item()
+
+        # 推进学习率调度器 (原版 BiomedCoOp 训练器同款钩子;
+        # 缺失导致 lr 永远停在 warmup 值 1e-5, 分类学不动)
+        if (self.batch_idx + 1) == self.num_batches:
+            self.update_lr()
+
         return ret
 
     def parse_batch_train(self, batch):

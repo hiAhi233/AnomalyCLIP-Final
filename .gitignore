@@ -4,6 +4,8 @@ __pycache__/
 *.pth.tar*
 checkpoint
 memory_bank.pt
+memory_bank_thymoma.pt
+memory_bank_mediastinum.pt
 output/
 data/
 tensorboard/
@@ -16,4 +18,4 @@ tensorboard/
 assets/
 BiomedCoOp-main/
 Dassl.pytorch/
-memory_bank_thymoma.pt
+models/

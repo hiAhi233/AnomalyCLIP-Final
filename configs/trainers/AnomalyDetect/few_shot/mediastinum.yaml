@@ -41,18 +41,26 @@ TRAINER:
     LAMBDA_CONSIST: 0.5
     THRESHOLD_STD: 1.5
     PATCH_TEMPERATURE: 0.07
-    MEMORY_BANK_PATH: "memory_bank_thymoma.pt"
+    MEMORY_BANK_PATH: "memory_bank_mediastinum.pt"
     MASK_MODE: true
     BG_FACTOR: 0.3
     LAMBDA_FUSION: 0.7
     GEN_MODE: true
     GEN_BACKEND: "qwen"
     QWEN_PATH: "models/qwen2.5-0.5b"
-    VOCAB_PATH: "data/Thymoma/vocab.pkl"
-    CAPTION_JSON: "data/Thymoma/captions.json"
-    TAGS_JSON: "data/Thymoma/thymoma_tags.json"
+    VOCAB_PATH: ""
+    CAPTION_JSON: "data/Mediastinum/captions.json"
+    TAGS_JSON: "data/Mediastinum/mediastinum_tags.json"
     S_MAX: 8
     N_MAX: 50
     LAMBDA_TAG: 0.5
     LAMBDA_STOP: 0.5
     LAMBDA_WORD: 1.0
+    LORA_R: 4
+    LORA_ALPHA: 8
+    LORA_DROPOUT: 0.1
+    VIS_TOKENS: 64
+    GEN_MAX_TOKENS: 120
+    GEN_TEMPERATURE: 0.4
+    PROMPT_LR: 0.0025
+    GEN_LR: 0.0001

@@ -12,6 +12,7 @@ from dassl.engine import build_trainer
 
 import datasets.busi
 import datasets.thymoma
+import datasets.mediastinum
 import datasets.lungcolon
 import datasets.chmnist
 import datasets.covid
@@ -110,6 +111,7 @@ def extend_cfg(cfg):
     from yacs.config import CfgNode as CN
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
+    cfg.DATASET.REP_ONLY = False  # True: 只用每患者代表层 (一图一标, 无标签噪声)
 
     cfg.TRAINER.COOP = CN()
     cfg.TRAINER.COOP.N_CTX = 4  # number of context vectors
@@ -146,7 +148,9 @@ def extend_cfg(cfg):
     cfg.TRAINER.ANOMALY_DETECT.MASK_MODE = True
     cfg.TRAINER.ANOMALY_DETECT.BG_FACTOR = 0.3
     cfg.TRAINER.ANOMALY_DETECT.LAMBDA_FUSION = 0.7  # 双流融合权重 (masked 流权重)
-    cfg.TRAINER.ANOMALY_DETECT.GEN_MODE = False    # 报告生成分支 (Vinyals 层级 LSTM)
+    cfg.TRAINER.ANOMALY_DETECT.GEN_MODE = False    # 报告生成分支
+    cfg.TRAINER.ANOMALY_DETECT.GEN_BACKEND = "qwen"  # "qwen" | "lstm"
+    cfg.TRAINER.ANOMALY_DETECT.QWEN_PATH = "models/qwen2.5-0.5b"
     cfg.TRAINER.ANOMALY_DETECT.VOCAB_PATH = ""
     cfg.TRAINER.ANOMALY_DETECT.CAPTION_JSON = ""
     cfg.TRAINER.ANOMALY_DETECT.TAGS_JSON = ""
@@ -155,6 +159,16 @@ def extend_cfg(cfg):
     cfg.TRAINER.ANOMALY_DETECT.LAMBDA_TAG = 0.5
     cfg.TRAINER.ANOMALY_DETECT.LAMBDA_STOP = 0.5
     cfg.TRAINER.ANOMALY_DETECT.LAMBDA_WORD = 1.0
+    # Qwen 生成器: LoRA 参数 + 多视觉词元 + 推理截断
+    cfg.TRAINER.ANOMALY_DETECT.LORA_R = 4
+    cfg.TRAINER.ANOMALY_DETECT.LORA_ALPHA = 8
+    cfg.TRAINER.ANOMALY_DETECT.LORA_DROPOUT = 0.1
+    cfg.TRAINER.ANOMALY_DETECT.VIS_TOKENS = 64
+    cfg.TRAINER.ANOMALY_DETECT.GEN_MAX_TOKENS = 120
+    cfg.TRAINER.ANOMALY_DETECT.GEN_TEMPERATURE = 0.4
+    # 分组学习率: 提示词/锚点投影 (BiomedCoOp 论文值 2.5e-3) vs 生成器 LoRA (1e-4)
+    cfg.TRAINER.ANOMALY_DETECT.PROMPT_LR = 0.0025
+    cfg.TRAINER.ANOMALY_DETECT.GEN_LR = 0.0001
 
     cfg.TRAINER.KGCOOP = CN()
     cfg.TRAINER.KGCOOP.CTX_INIT = "a photo of a"  # initialization words

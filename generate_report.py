@@ -385,20 +385,25 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                 if patient_idx == 0:
                     print(f'[DEBUG] gen_mode={gen_mode} has_report_gen={hasattr(trainer.model, "report_gen")}')
                 if gen_mode and hasattr(trainer.model, 'report_gen'):
-                    if _gen_cache[0] is None:
-                        import pickle as _pkl
-                        vp = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', 'data/Thymoma/vocab.pkl')
-                        with open(vp, 'rb') as f:
-                            _gen_cache[0] = _pkl.load(f)
+                    gen_backend = getattr(cfg.TRAINER.ANOMALY_DETECT, 'GEN_BACKEND', 'qwen')
                     masked_img = single_outputs[4]
-                    masked_feat, _ = trainer.model._extract_patch_tokens(masked_img)
+                    masked_feat, masked_patches = trainer.model._extract_patch_tokens(masked_img)
                     masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
 
-                    # --- ① 先用生成器写报告文本 ---
-                    gen_texts = trainer.model.report_gen.generate(
-                        masked_feat_norm, _gen_cache[0],
-                        max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
-                        max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
+                    # --- ① 先用生成器写报告文本 (qwen / lstm 接口不同) ---
+                    if gen_backend == 'qwen':
+                        # 多视觉词元版: 传 patch token 序列 (生成器内部含截断/温度)
+                        gen_texts = trainer.model.report_gen.generate(masked_patches)
+                    else:
+                        if _gen_cache[0] is None:
+                            import pickle as _pkl
+                            vp = getattr(cfg.TRAINER.ANOMALY_DETECT, 'VOCAB_PATH', 'data/Thymoma/vocab.pkl')
+                            with open(vp, 'rb') as f:
+                                _gen_cache[0] = _pkl.load(f)
+                        gen_texts = trainer.model.report_gen.generate(
+                            masked_feat_norm, _gen_cache[0],
+                            max_sentences=getattr(cfg.TRAINER.ANOMALY_DETECT, 'S_MAX', 8),
+                            max_words=getattr(cfg.TRAINER.ANOMALY_DETECT, 'N_MAX', 50))
                     gen_text = gen_texts[0] if gen_texts else ""
                     if gen_text:
                         result["raw_text"] = f"医学影像AI辅助分析报告\n\n{gen_text}\n\n免责声明:\n本报告由AI辅助分析系统自动生成，仅供临床参考。"

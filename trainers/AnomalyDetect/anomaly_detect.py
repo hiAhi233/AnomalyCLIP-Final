@@ -195,7 +195,8 @@ class AnomalyCLIP(nn.Module):
             lam = min(lam, 0.3)
         return lam
 
-    def forward(self, image, label=None, captions=None, prob_real=None, tag_target=None, struct=None):
+    def forward(self, image, label=None, captions=None, prob_real=None, tag_target=None,
+                struct=None, size_ids=None, size_mask=None):
         logit_scale = self.logit_scale.exp()
 
         # ---- extract features ----
@@ -310,10 +311,10 @@ class AnomalyCLIP(nn.Module):
                 # 生成器视觉输入 = 全图 patch (不再用掩膜图 — 掩膜质量不绑架报告)
                 # 代表层本就以病灶为最大软组织层, 病灶信息在全图 patch 中可读
                 if self.gen_backend == 'qwen':
-                    # Qwen: [视觉词元 | 征象词元 | 报告 token] → 标量 loss
+                    # Qwen: [视觉词元 | 尺寸文本 | 征象词元 | 报告 token] → 标量 loss
                     # (非代表层全 pad → 批内自动不计损失)
                     gen_loss = self.report_gen(
-                        patch_tokens, struct, captions, prob_real)
+                        patch_tokens, size_ids, size_mask, struct, captions, prob_real)
                     gen_losses = {'loss_word': gen_loss}
                     loss_ce = loss_ce + self.lambda_word * gen_loss
                 else:
@@ -348,7 +349,8 @@ class ThymomaReportWrapper(DasslWrapper):
 
     def __init__(self, cfg, data_source, transform=None, is_train=False,
                  vocab=None, captions=None, tags=None, s_max=8, n_max=50,
-                 tokenizer=None, qwen_backend=False, struct_feats=None):
+                 tokenizer=None, qwen_backend=False, struct_feats=None,
+                 size_texts=None, size_max_len=24):
         super().__init__(cfg, data_source, transform, is_train)
         self.vocab = vocab
         self.captions = captions      # {image_name: report_text}
@@ -358,6 +360,8 @@ class ThymomaReportWrapper(DasslWrapper):
         self.tokenizer = tokenizer    # Qwen tokenizer (qwen 模式)
         self.qwen_backend = qwen_backend
         self.struct_feats = struct_feats  # {pid_str: tensor(19)} 结构化征象(标准化)
+        self.size_texts = size_texts      # {pid_str: str} 尺寸文本 ("长径18mm，短径35mm")
+        self.size_max_len = size_max_len
 
     def __getitem__(self, idx):
         output = super().__getitem__(idx)
@@ -416,6 +420,18 @@ class ThymomaReportWrapper(DasslWrapper):
             output["struct"] = self.struct_feats.get(pid, torch.zeros(19))
         else:
             output["struct"] = torch.zeros(19)
+
+        # 尺寸文本 token (精确数字走离散文字, 无 MLP 损耗)
+        if self.qwen_backend and self.tokenizer is not None:
+            size_str = (self.size_texts or {}).get(pid, "大小未测")
+            enc = self.tokenizer(size_str, truncation=True,
+                                 max_length=self.size_max_len,
+                                 padding='max_length', return_tensors='pt')
+            output["size_ids"] = enc['input_ids'][0]
+            output["size_mask"] = enc['attention_mask'][0]
+        else:
+            output["size_ids"] = torch.zeros(self.size_max_len, dtype=torch.long)
+            output["size_mask"] = torch.zeros(self.size_max_len, dtype=torch.long)
 
         return output
 
@@ -480,8 +496,10 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         print(f'[ReportGen] captions={len(captions)} tags={len(tags)}')
 
         # ---- 结构化征象: 从 CSV 读 19 维测量值, 标准化后按患者索引 ----
-        struct_feats = {}
+        # ---- 尺寸文本: 精确数字走文字 token (无 MLP 损耗) ----
+        struct_feats, size_texts = {}, {}
         if gen_backend == 'qwen':
+            from trainers.AnomalyDetect.report_generator_qwen import build_size_text as _bst
             csv_path = getattr(self.cfg.TRAINER.ANOMALY_DETECT, 'STRUCT_CSV', '')
             if csv_path and os.path.exists(csv_path):
                 import pandas as _pd
@@ -500,17 +518,20 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
                 _sc = _SS().fit(_X.values)
                 _Xs = _sc.transform(_X.values)
                 for _i, _row in _df.iterrows():
-                    struct_feats[str(int(_row['影像号']))] = torch.tensor(
-                        _Xs[_i], dtype=torch.float)
-                print(f'[ReportGen] 结构化征象: {len(struct_feats)} 患者 x {_Xs.shape[1]} 维')
+                    _pid = str(int(_row['影像号']))
+                    struct_feats[_pid] = torch.tensor(_Xs[_i], dtype=torch.float)
+                    size_texts[_pid] = _bst({'长径mm': _row.get('长径mm'),
+                                             '短径mm': _row.get('短径mm')})
+                print(f'[ReportGen] 结构化征象: {len(struct_feats)} 患者 x {_Xs.shape[1]} 维, '
+                      f'尺寸文本: {len(size_texts)} 患者')
             else:
-                print('[ReportGen] 未找到 STRUCT_CSV, 结构化征象置零')
+                print('[ReportGen] 未找到 STRUCT_CSV, 结构化征象/尺寸文本置空')
 
         # ---- 重建训练 loader (带报告) ----
         wrapper_cls = partial(ThymomaReportWrapper, vocab=self.vocab,
                               captions=captions, tags=tags, s_max=s_max, n_max=n_max,
                               tokenizer=qwen_tok, qwen_backend=(gen_backend == 'qwen'),
-                              struct_feats=struct_feats)
+                              struct_feats=struct_feats, size_texts=size_texts)
         # 从 dm 内部取训练 transform (DataManager 未暴露, 用 _ 前缀属性)
         tfm_train = getattr(self.dm, 'tfm_train', None)
         if tfm_train is None:
@@ -551,7 +572,16 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         print(f'Trainable: {len(enabled)} — {enabled}')
 
         if cfg.MODEL.INIT_WEIGHTS:
-            load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
+            # 热启动: 按名加载 (torch2.6 weights_only 默认值会拒绝含调度器的检查点,
+            # 文件为本项目自产, 显式 weights_only=False)
+            _ckpt = torch.load(cfg.MODEL.INIT_WEIGHTS, map_location='cpu', weights_only=False)
+            _sd = _ckpt['state_dict'] if 'state_dict' in _ckpt else _ckpt
+            _model_sd = self.model.state_dict()
+            _new = {k: v for k, v in _sd.items()
+                    if k in _model_sd and _model_sd[k].shape == v.shape}
+            print(f'INIT_WEIGHTS: 加载 {len(_new)}/{len(_sd)} 层 from {cfg.MODEL.INIT_WEIGHTS}')
+            _model_sd.update(_new)
+            self.model.load_state_dict(_model_sd)
 
         self.model.to(self.device)
         # ---- 分组学习率: 提示词按论文值, LoRA/投影按 LoRA 安全值 ----
@@ -590,12 +620,17 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
         prob_real = batch.get("prob_real", None)
         tag_target = batch.get("tags", None)
         struct = batch.get("struct", None)
+        size_ids = batch.get("size_ids", None)
+        size_mask = batch.get("size_mask", None)
         if captions is not None:
             captions = captions.to(self.device)
             prob_real = prob_real.to(self.device)
             tag_target = tag_target.to(self.device)
         if struct is not None:
             struct = struct.to(self.device)
+        if size_ids is not None:
+            size_ids = size_ids.to(self.device)
+            size_mask = size_mask.to(self.device)
 
         if prec == 'amp':
             with autocast():
@@ -605,7 +640,7 @@ class AnomalyDetect_BiomedCLIP(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            out = model(image, label, captions, prob_real, tag_target, struct)
+            out = model(image, label, captions, prob_real, tag_target, struct, size_ids, size_mask)
             logits, loss_ce, loss_sccm, loss_kdsp, loss_consist, s_img = out[:6]
             gen_losses = out[6] if len(out) > 6 else None
             loss = loss_ce + loss_sccm + loss_kdsp + loss_consist

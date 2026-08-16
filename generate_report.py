@@ -268,13 +268,15 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                         real_refs[pid] = fp.read().strip()
     print(f"  加载了 {len(real_refs)} 份真实报告作为 NLG 参考")
 
-    # ---- 结构化征象查询表 (与训练侧同逻辑: 19维标准化) ----
+    # ---- 结构化征象查询表 (与训练侧同逻辑: 19维标准化 + 尺寸文本) ----
     import torch as _torch
     _struct_map = {}
+    _size_map = {}
     _csv_path = getattr(cfg.TRAINER.ANOMALY_DETECT, 'STRUCT_CSV', '')
     if _csv_path and os.path.exists(_csv_path):
         import pandas as _pd
         from sklearn.preprocessing import StandardScaler as _SS
+        from trainers.AnomalyDetect.report_generator_qwen import build_size_text as _bst
         _df = _pd.read_csv(_csv_path)
         _df['影像号'] = _df['影像号'].astype(int)
         _NUM_F = ['长径mm', '短径mm', '年龄', '胸大肌平扫密度CT值', '肿块平扫密度CT值',
@@ -288,11 +290,16 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
         _X = _X.fillna(_X.median())
         _Xs = _SS().fit(_X.values).transform(_X.values)
         for _i, _row in _df.iterrows():
-            _struct_map[int(_row['影像号'])] = _torch.tensor(_Xs[_i], dtype=_torch.float)
-        print(f"  加载结构化征象: {len(_struct_map)} 患者")
+            _pid = int(_row['影像号'])
+            _struct_map[_pid] = _torch.tensor(_Xs[_i], dtype=_torch.float)
+            _size_map[_pid] = _bst({'长径mm': _row.get('长径mm'), '短径mm': _row.get('短径mm')})
+        print(f"  加载结构化征象: {len(_struct_map)} 患者, 尺寸文本: {len(_size_map)} 患者")
 
     def _struct_lookup(pid):
         return _struct_map.get(pid, _torch.zeros(19))
+
+    def _size_lookup(pid):
+        return _size_map.get(pid, "大小未测")
 
     # 读 split JSON 获取测试集路径→患者ID映射
     split_path = os.path.join(data_dir, f"split_{cfg.DATASET.NAME}.json")
@@ -415,11 +422,12 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
 
                     # --- ① 先用生成器写报告文本 (qwen / lstm 接口不同) ---
                     if gen_backend == 'qwen':
-                        # 全图 patch (去掩膜) + 结构化征象 → 报告
+                        # 全图 patch (去掩膜) + 尺寸文本 + 结构化征象 → 报告
                         full_patches = trainer.model._extract_patch_tokens(image[i:i+1])[1]
                         struct = _struct_lookup(pid)   # [19] 标准化征象
                         gen_texts = trainer.model.report_gen.generate(
-                            full_patches, struct.unsqueeze(0).to(trainer.device))
+                            full_patches, [_size_lookup(pid)],
+                            struct.unsqueeze(0).to(trainer.device))
                     else:
                         masked_img = single_outputs[4]
                         masked_feat, masked_patches = trainer.model._extract_patch_tokens(masked_img)

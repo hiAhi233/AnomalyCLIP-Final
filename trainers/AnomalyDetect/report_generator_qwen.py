@@ -15,9 +15,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def build_size_text(feat: dict) -> str:
+    """尺寸以文字注入 (精确数字走离散 token, 无 MLP 损耗)
+    feat: {'长径mm':..., '短径mm':...}
+    """
+    parts = []
+    ld = feat.get('长径mm')
+    sd = feat.get('短径mm')
+    if ld is not None and not (isinstance(ld, float) and ld != ld):
+        parts.append(f"长径{ld:.0f}mm")
+    if sd is not None and not (isinstance(sd, float) and sd != sd):
+        parts.append(f"短径{sd:.0f}mm")
+    return '，'.join(parts) if parts else "大小未测"
+
+
 class QwenReportGenerator(nn.Module):
     def __init__(self, model_path='models/qwen2.5-0.5b', patch_dim=768,
-                 vis_tokens=64, struct_dim=19, struct_tokens=4,
+                 vis_tokens=64, struct_dim=19, struct_tokens=4, size_max_len=24,
                  lora_r=4, lora_alpha=8, lora_dropout=0.1,
                  max_length=256, gen_max_tokens=110, temperature=0.4,
                  stop_words=("手术", "病理", "免疫组化", "Assistant", "病史"), device=None):
@@ -31,6 +45,7 @@ class QwenReportGenerator(nn.Module):
         self.grid = int(vis_tokens ** 0.5)  # 64 → 8x8
         self.struct_dim = struct_dim
         self.struct_tokens = struct_tokens
+        self.size_max_len = size_max_len
 
         # ---- 加载 Qwen (bf16, 冻结主干) ----
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -86,11 +101,13 @@ class QwenReportGenerator(nn.Module):
         return proj.view(-1, self.struct_tokens, self.embed_dim)  # [B, K, D]
 
     # ----------------------------------------------------------
-    # 教师强制训练: [视觉词元 | 征象词元 | 报告 token] → 下一个 token
+    # 教师强制训练: [视觉 | 尺寸文本 | 征象词元 | 报告] → 下一个 token
     # ----------------------------------------------------------
-    def forward(self, visual_patches, struct_feat, input_ids, attention_mask):
+    def forward(self, visual_patches, size_ids, size_mask, struct_feat, input_ids, attention_mask):
         """
         visual_patches: [B, 196, 768]  trunk 原始 patch token (全图, 不再用掩膜图)
+        size_ids:       [B, S1]       尺寸文本 token (pad 填充)
+        size_mask:      [B, S1]
         struct_feat:    [B, 19]        结构化征象 (标准化后)
         input_ids:      [B, L]         报告 token 序列 (非代表层 → 全 pad)
         attention_mask: [B, L]         非代表层 → 全 0
@@ -98,13 +115,16 @@ class QwenReportGenerator(nn.Module):
         """
         B = visual_patches.shape[0]
 
-        vis_emb = self._visual_emb(visual_patches)                # [B, V, D]
-        struct_emb = self._struct_emb(struct_feat)                # [B, K, D]
-        text_emb = self.qwen.get_input_embeddings()(input_ids)   # [B, L, D]
+        vis_emb = self._visual_emb(visual_patches)                    # [B, V, D]
+        size_emb = self.qwen.get_input_embeddings()(size_ids)        # [B, S1, D]
+        struct_emb = self._struct_emb(struct_feat)                    # [B, K, D]
+        text_emb = self.qwen.get_input_embeddings()(input_ids)       # [B, L, D]
 
-        inputs_embeds = torch.cat([vis_emb, struct_emb, text_emb], dim=1)
-        n_pre = vis_emb.shape[1] + struct_emb.shape[1]
-        pre_mask = torch.ones(B, n_pre, dtype=attention_mask.dtype, device=self.device)
+        inputs_embeds = torch.cat([vis_emb, size_emb, struct_emb, text_emb], dim=1)
+        vis_mask = torch.ones(B, vis_emb.shape[1], dtype=attention_mask.dtype, device=self.device)
+        n_pre = vis_emb.shape[1] + size_emb.shape[1] + struct_emb.shape[1]
+        pre_mask = torch.cat([vis_mask, size_mask,
+                              torch.ones(B, struct_emb.shape[1], dtype=attention_mask.dtype, device=self.device)], dim=1)
         attn = torch.cat([pre_mask, attention_mask], dim=1)
 
         labels = input_ids.clone()
@@ -121,12 +141,13 @@ class QwenReportGenerator(nn.Module):
         return outputs.loss
 
     # ----------------------------------------------------------
-    # 推理: 图像 + 征象 → 报告 (带停止词截断, 防病理幻觉)
+    # 推理: 图像 + 尺寸文本 + 征象 → 报告
     # ----------------------------------------------------------
     @torch.no_grad()
-    def generate(self, visual_patches, struct_feat, max_new_tokens=None, temperature=None):
+    def generate(self, visual_patches, size_texts, struct_feat, max_new_tokens=None, temperature=None):
         """
         visual_patches: [B, 196, 768]
+        size_texts:     list[str] 尺寸文本 (长度 B)
         struct_feat:    [B, 19]
         Returns: list[str]
         """
@@ -136,9 +157,17 @@ class QwenReportGenerator(nn.Module):
         temperature = temperature if temperature is not None else self.temperature
 
         vis_emb = self._visual_emb(visual_patches)                # [B, V, D]
+        vis_mask = torch.ones(B, vis_emb.shape[1], dtype=torch.long, device=self.device)
+
+        # 尺寸文本 tokenize
+        enc = self.tokenizer(size_texts, padding=True, truncation=True,
+                             max_length=self.size_max_len, return_tensors='pt')
+        size_ids = enc['input_ids'].to(self.device)
+        size_mask = enc['attention_mask'].to(self.device)
+        size_emb = self.qwen.get_input_embeddings()(size_ids)
+
         struct_emb = self._struct_emb(struct_feat)                # [B, K, D]
-        n_pre = vis_emb.shape[1] + struct_emb.shape[1]
-        pre_mask = torch.ones(B, n_pre, dtype=torch.long, device=self.device)
+        struct_mask = torch.ones(B, struct_emb.shape[1], dtype=torch.long, device=self.device)
 
         # 直启式提示: 给报告起始语让模型续写, 避免 Qwen 进入聊天模式
         prompt = "影像所见："
@@ -146,8 +175,8 @@ class QwenReportGenerator(nn.Module):
         prompt_emb = self.qwen.get_input_embeddings()(prompt_ids).repeat(B, 1, 1)
         prompt_mask = torch.ones(B, prompt_emb.shape[1], dtype=torch.long, device=self.device)
 
-        inputs_embeds = torch.cat([vis_emb, struct_emb, prompt_emb], dim=1)
-        attn = torch.cat([pre_mask, prompt_mask], dim=1)
+        inputs_embeds = torch.cat([vis_emb, size_emb, struct_emb, prompt_emb], dim=1)
+        attn = torch.cat([vis_mask, size_mask, struct_mask, prompt_mask], dim=1)
 
         out_ids = self.qwen.generate(
             inputs_embeds=inputs_embeds, attention_mask=attn,
@@ -189,20 +218,22 @@ if __name__ == '__main__':
     print(f'Qwen embed dim: {gen.embed_dim}')
 
     # 训练模式自测
-    B, L = 2, 32
+    B, L, S1 = 2, 32, 16
     patches = torch.randn(B, 196, 768).to(gen.device)
+    size_ids = torch.randint(100, 1000, (B, S1)).to(gen.device)
+    size_mask = torch.ones(B, S1, dtype=torch.long).to(gen.device)
     struct = torch.randn(B, 19).to(gen.device)
     ids = torch.randint(100, 1000, (B, L)).to(gen.device)
     mask = torch.ones(B, L, dtype=torch.long).to(gen.device)
-    loss = gen(patches, struct, ids, mask)
+    loss = gen(patches, size_ids, size_mask, struct, ids, mask)
     print(f'train loss: {loss.item():.4f}')
     loss.backward()
     print('forward+backward OK')
 
     # 全空批自测 (非代表层)
-    loss0 = gen(patches, struct, ids, torch.zeros_like(mask))
+    loss0 = gen(patches, size_ids, size_mask, struct, ids, torch.zeros_like(mask))
     print(f'empty-batch loss: {loss0.item():.4f}')
 
     # 推理自测
-    texts = gen.generate(patches[:1], struct[:1], max_new_tokens=50)
+    texts = gen.generate(patches[:1], ["长径18mm，短径35mm"], struct[:1], max_new_tokens=50)
     print(f'generated: {texts[0][:200]}')

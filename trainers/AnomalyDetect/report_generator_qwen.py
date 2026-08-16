@@ -31,7 +31,7 @@ def build_size_text(feat: dict) -> str:
 
 class QwenReportGenerator(nn.Module):
     def __init__(self, model_path='models/qwen2.5-0.5b', patch_dim=768,
-                 vis_tokens=64, struct_dim=19, struct_tokens=4, size_max_len=24,
+                 vis_tokens=64, struct_dim=19, struct_tokens=4, size_max_len=32,
                  lora_r=4, lora_alpha=8, lora_dropout=0.1,
                  max_length=256, gen_max_tokens=110, temperature=0.4,
                  stop_words=("手术", "病理", "免疫组化", "Assistant", "病史"), device=None):

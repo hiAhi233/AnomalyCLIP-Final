@@ -24,6 +24,9 @@ OPTIM:
 TRAIN:
   PRINT_FREQ: 10
 
+TEST:
+  NO_TEST: true
+
 MODEL:
   BACKBONE:
     NAME: "ViT-B/16"

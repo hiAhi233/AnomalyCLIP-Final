@@ -301,6 +301,40 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     def _size_lookup(pid):
         return _size_map.get(pid, "大小未测")
 
+    # ---- 结构化分类器 (11类, 已验证 56.5%) 接管"预测类别" ----
+    import joblib as _jl
+    _cls_model, _cls_scaler = None, None
+    _cls_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', 'classification')
+    try:
+        _cls_model = _jl.load(os.path.join(_cls_dir, 'class11_model.joblib'))
+        _cls_scaler = _jl.load(os.path.join(_cls_dir, 'scaler.joblib'))
+        print('  已加载结构化分类器 (11类, test 56.5%)')
+    except Exception as _e:
+        print(f'  结构化分类器加载失败 ({_e}), 回退 Path A')
+    _CLS_EN = ['thymoma', 'thymic_carcinoma', 'cyst', 'teratoma', 'lymphoma',
+               'germ_cell_tumor', 'neuroendocrine_tumor', 'hyperplasia',
+               'benign_lesion', 'metastasis', 'other_malignant']
+    _CLS_CN = ['胸腺瘤', '胸腺癌', '良性囊肿', '畸胎瘤', '淋巴瘤',
+               '生殖细胞肿瘤', '神经内分泌肿瘤', '胸腺增生', '良性病变', '转移瘤', '其他恶性']
+
+    # 原始 19 维特征表 (分类器自带 scaler, 与训练一致)
+    _raw_map = {}
+    if _csv_path and os.path.exists(_csv_path):
+        _df2 = _pd.read_csv(_csv_path)
+        _df2['影像号'] = _df2['影像号'].astype(int)
+        for _i, _row in _df2.iterrows():
+            _pid = int(_row['影像号'])
+            _raw_map[_pid] = _X.iloc[_i].values  # _X 已在上面构建 (19维, fillna后)
+
+    def _classify(pid):
+        """返回 (英文类名, 概率, 中文提示)"""
+        if _cls_model is not None and pid in _raw_map:
+            _v = _cls_scaler.transform(_raw_map[pid].reshape(1, -1))
+            _probs = _cls_model.predict_proba(_v)[0]
+            _k = int(_probs.argmax())
+            return _CLS_EN[_k], float(_probs[_k]), f"分类参考：{_CLS_CN[_k]}。"
+        return None, None, ""
+
     # 读 split JSON 获取测试集路径→患者ID映射
     split_path = os.path.join(data_dir, f"split_{cfg.DATASET.NAME}.json")
     test_paths = []
@@ -371,20 +405,20 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                     pid = int(m.group(1))
                     ref_text = real_refs.get(pid, "")
 
-                single_outputs = (
-                    outputs[0][i:i+1],
-                    outputs[1][i] if outputs[1].dim() > 0 else outputs[1],
-                    outputs[2][i:i+1] if outputs[2].dim() > 1 else outputs[2],
-                    outputs[3],
-                    outputs[4][i:i+1] if outputs[4] is not None and outputs[4].dim() > 1 else outputs[4],
-                )
+                # 模型 eval 输出: (s_img, anomaly_scores, masked_image)
+                s_img_b = outputs[0]          # [B]
+                amap_b = outputs[1]           # [B, 196]
+                masked_b = outputs[2]         # [B, 3, 224, 224] or None
 
-                # ---- 直接从模型输出构建 findings (不再走模板生成器) ----
-                probs = torch.softmax(single_outputs[0], dim=-1)
-                top_idx = probs.argmax(dim=-1).item()
-                top_prob = probs[0, top_idx].item()
-                top_class = classnames[top_idx] if top_idx < len(classnames) else "未知"
-                s_img_val = single_outputs[1]
+                # ---- 预测类别: 结构化分类器 (Path A 已退役) ----
+                _cls_en, _cls_prob, _cls_hint = _classify(pid)
+                if _cls_en is not None:
+                    top_class = _cls_en
+                    top_prob = _cls_prob
+                else:
+                    top_class = "未知"
+                    top_prob = 0.0
+                s_img_val = s_img_b[i]
                 if isinstance(s_img_val, torch.Tensor):
                     s_img_val = s_img_val.item() if s_img_val.numel() == 1 else s_img_val.mean().item()
 
@@ -422,14 +456,15 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
 
                     # --- ① 先用生成器写报告文本 (qwen / lstm 接口不同) ---
                     if gen_backend == 'qwen':
-                        # 全图 patch (去掩膜) + 尺寸文本 + 结构化征象 → 报告
+                        # 全图 patch (去掩膜) + 分类提示 + 尺寸文本 + 结构化征象 → 报告
                         full_patches = trainer.model._extract_patch_tokens(image[i:i+1])[1]
                         struct = _struct_lookup(pid)   # [19] 标准化征象
+                        _size_text = (_cls_hint or "") + _size_lookup(pid)
                         gen_texts = trainer.model.report_gen.generate(
-                            full_patches, [_size_lookup(pid)],
+                            full_patches, [_size_text],
                             struct.unsqueeze(0).to(trainer.device))
                     else:
-                        masked_img = single_outputs[4]
+                        masked_img = masked_b[i:i+1] if masked_b is not None else image[i:i+1]
                         masked_feat, masked_patches = trainer.model._extract_patch_tokens(masked_img)
                         masked_feat_norm = masked_feat / masked_feat.norm(dim=-1, keepdim=True)
                         if _gen_cache[0] is None:

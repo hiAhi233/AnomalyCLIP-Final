@@ -301,21 +301,30 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     def _size_lookup(pid):
         return _size_map.get(pid, "大小未测")
 
-    # ---- 结构化分类器 (11类, 已验证 56.5%) 接管"预测类别" ----
+    # ---- 结构化分类器 (11类, 已融合热力读数: 19维征象 + 11维区域热力) ----
     import joblib as _jl
     _cls_model, _cls_scaler = None, None
     _cls_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', 'classification')
     try:
         _cls_model = _jl.load(os.path.join(_cls_dir, 'class11_model.joblib'))
         _cls_scaler = _jl.load(os.path.join(_cls_dir, 'scaler.joblib'))
-        print('  已加载结构化分类器 (11类, test 56.5%)')
+        print('  已加载结构化分类器 (11类, 19维征象)')
     except Exception as _e:
-        print(f'  结构化分类器加载失败 ({_e}), 回退 Path A')
+        print(f'  结构化分类器加载失败 ({_e})')
     _CLS_EN = ['thymoma', 'thymic_carcinoma', 'cyst', 'teratoma', 'lymphoma',
                'germ_cell_tumor', 'neuroendocrine_tumor', 'hyperplasia',
                'benign_lesion', 'metastasis', 'other_malignant']
     _CLS_CN = ['胸腺瘤', '胸腺癌', '良性囊肿', '畸胎瘤', '淋巴瘤',
                '生殖细胞肿瘤', '神经内分泌肿瘤', '胸腺增生', '良性病变', '转移瘤', '其他恶性']
+
+    # ---- 融合分类器 (19维 + 热力11维, 探针验证 84.3%/58.3%) ----
+    _fus_model, _fus_scaler = None, None
+    try:
+        _fus_model = _jl.load(os.path.join(_cls_dir, 'class11_fusion_model.joblib'))
+        _fus_scaler = _jl.load(os.path.join(_cls_dir, 'scaler_fusion.joblib'))
+        print('  已加载融合分类器 (19维+热力11维, 84.3%/58.3%)')
+    except Exception as _e:
+        print(f'  融合分类器未找到 ({_e}), 用 19 维分类器')
 
     # 原始 19 维特征表 (分类器自带 scaler, 与训练一致)
     _raw_map = {}
@@ -326,10 +335,29 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
             _pid = int(_row['影像号'])
             _raw_map[_pid] = _X.iloc[_i].values  # _X 已在上面构建 (19维, fillna后)
 
-    def _classify(pid):
-        """返回 (英文类名, 概率, 中文提示)"""
-        if _cls_model is not None and pid in _raw_map:
-            _v = _cls_scaler.transform(_raw_map[pid].reshape(1, -1))
+    def _heat11_from_amap(amap_14):
+        """14×14 热力图 → 9维区域分布 + 2维强度 (与探针同逻辑)"""
+        c = np.zeros(9)
+        for i in range(14):
+            for j in range(14):
+                c[min(i * 3 // 14, 2) * 3 + min(j * 3 // 14, 2)] += amap_14[i, j]
+        c = c / (c.sum() + 1e-8)
+        return np.concatenate([c, [float(np.mean(amap_14)), float(np.max(amap_14))]])
+
+    def _classify(pid, heat_amap=None):
+        """返回 (英文类名, 概率, 中文提示)
+        heat_amap: [14,14] 热力图 (若有 → 优先用融合分类器)"""
+        if pid not in _raw_map:
+            return None, None, ""
+        base = _raw_map[pid].reshape(1, -1)
+        # 融合分类器优先 (有热力图时)
+        if heat_amap is not None and _fus_model is not None:
+            _v = _fus_scaler.transform(np.hstack([base, _heat11_from_amap(heat_amap).reshape(1, -1)]))
+            _probs = _fus_model.predict_proba(_v)[0]
+            _k = int(_probs.argmax())
+            return _CLS_EN[_k], float(_probs[_k]), f"分类参考：{_CLS_CN[_k]}。"
+        if _cls_model is not None:
+            _v = _cls_scaler.transform(base)
             _probs = _cls_model.predict_proba(_v)[0]
             _k = int(_probs.argmax())
             return _CLS_EN[_k], float(_probs[_k]), f"分类参考：{_CLS_CN[_k]}。"
@@ -347,32 +375,43 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
     test_loader = trainer.test_loader
     trainer.model.eval()
 
-    # ---- 预扫描: 每患者选代表切片 (增强期 + z 最大 = 肿瘤最大层) ----
-    # 文件名: P124_平扫_z52.png / P124_增强_z54.png
-    # 无此命名模式的数据集 (如 BUSI): 全部处理, 不按患者去重
+    # ---- 预扫描: 每患者选代表切片 ----
+    # 首选: _rep.txt 标记 (软组织最多层 = 病灶最大层, 与分类/生成训练完全一致)
+    # 回退: 增强期 + z 最大 (无 _rep.txt 的数据集, 如 BUSI: 逐张处理)
     chosen_indices = set()   # 被选中的切片下标
-    best_slice = {}          # pid -> (z, seq, idx)
-    patient_named = False
-    for idx, path in enumerate(test_paths):
-        m = re.match(r'P(\d+)_(\S+)_z(\d+)\.png', os.path.basename(path))
-        if not m:
-            continue
-        patient_named = True
-        pid = int(m.group(1))
-        seq = m.group(2)      # "平扫" or "增强"
-        z = int(m.group(3))
-        # 增强优先, 同序列 z 最大优先
-        key = (1 if "增强" in seq else 0, z)
-        if pid not in best_slice or key > best_slice[pid][0]:
-            best_slice[pid] = (key, idx)
-    if patient_named:
-        for pid, (_, idx) in best_slice.items():
-            chosen_indices.add(idx)
-        print(f"  测试集代表切片: {len(best_slice)} 个患者 (增强期肿瘤最大层)")
+    rep_names = {}           # {basename: 1} 所有 _rep.txt 标记的切片
+    for dp, _, fns in os.walk(data_dir):
+        for f in fns:
+            if f.endswith('_rep.txt'):
+                with open(os.path.join(dp, f), encoding='utf-8') as fp:
+                    rep_names[fp.read().strip()] = 1
+    if rep_names:
+        for idx, path in enumerate(test_paths):
+            if os.path.basename(path) in rep_names:
+                chosen_indices.add(idx)
+        print(f"  测试集代表切片: {len(chosen_indices)} 个患者 (_rep.txt 病灶最大层, 与训练一致)")
     else:
-        # 无患者命名的数据集: 每张图独立处理
-        chosen_indices = set(range(len(test_paths)))
-        print(f"  测试集: {len(test_paths)} 张图像 (无患者命名, 逐张处理)")
+        # 无 _rep.txt: 回退 增强期+z最大; 再无 → 逐张处理
+        best_slice = {}
+        patient_named = False
+        for idx, path in enumerate(test_paths):
+            m = re.match(r'P(\d+)_(\S+)_z(\d+)\.png', os.path.basename(path))
+            if not m:
+                continue
+            patient_named = True
+            pid = int(m.group(1))
+            seq = m.group(2)
+            z = int(m.group(3))
+            key = (1 if "增强" in seq else 0, z)
+            if pid not in best_slice or key > best_slice[pid][0]:
+                best_slice[pid] = (key, idx)
+        if patient_named:
+            for pid, (_, idx) in best_slice.items():
+                chosen_indices.add(idx)
+            print(f"  测试集代表切片: {len(best_slice)} 个患者 (增强期肿瘤最大层)")
+        else:
+            chosen_indices = set(range(len(test_paths)))
+            print(f"  测试集: {len(test_paths)} 张图像 (无患者命名, 逐张处理)")
 
     patient_idx = 0
     slice_idx = 0
@@ -410,8 +449,9 @@ def real_mode(config_file, dataset_config_file, model_dir, image_path):
                 amap_b = outputs[1]           # [B, 196]
                 masked_b = outputs[2]         # [B, 3, 224, 224] or None
 
-                # ---- 预测类别: 结构化分类器 (Path A 已退役) ----
-                _cls_en, _cls_prob, _cls_hint = _classify(pid)
+                # ---- 预测类别: 融合分类器 (19维征象 + 热力区域读数) ----
+                _amap_i = amap_b[i].reshape(14, 14).cpu().numpy() if amap_b is not None else None
+                _cls_en, _cls_prob, _cls_hint = _classify(pid, _amap_i)
                 if _cls_en is not None:
                     top_class = _cls_en
                     top_prob = _cls_prob
